@@ -1,0 +1,361 @@
+# Rollout-operator runbooks
+
+## Leader election and webhook failover
+
+Leader election is disabled by default. Enable high availability with `-leader-election.enabled=true` or the Jsonnet option `rollout_operator_leader_election_enabled: true`. See [Leader election](../README.md#leader-election) for the required RBAC, pod identity, and webhook Service selector.
+
+Only the elected leader runs controllers and serves admission webhooks. Healthy standby pods report Ready; readiness alone does not identify the leader. Inspect the Lease and the pod selected for webhook traffic:
+
+```bash
+kubectl -n <namespace> get lease rollout-operator -o yaml
+kubectl -n <namespace> get pods -l rollout-operator.grafana.com/leader=true
+kubectl -n <namespace> get endpointslices -l kubernetes.io/service-name=rollout-operator
+```
+
+The Lease's `spec.holderIdentity` identifies the elected instance. Replace `rollout-operator` if `-leader-election.lease-name` is customized.
+
+Depending on the failure scenario, there is a delay before the new leader starts serving webhooks. The replacement waits for Lease expiration (default `-leader-election.lease-duration=15s`), initializes its controllers and webhook server, and sets its leader pod label; Service endpoint propagation adds further delay. During webhook unavailability, `failurePolicy: Fail` ensures that eviction and scale requests matching the configured webhooks are denied. Keep this policy enabled to preserve rollout and disruption safeguards during failover.
+
+### Monitor the Lease with kube-state-metrics
+
+Ensure kube-state-metrics collects `leases` in the operator's namespace and has `list` and `watch` access to `leases` in the `coordination.k8s.io` API group. These [Lease metrics](https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/cluster/lease-metrics.md) are experimental; verify that your installed version exposes them.
+
+Show the current holder in the `lease_holder` label:
+
+```promql
+kube_lease_owner{namespace="<namespace>", lease="rollout-operator"} == 1
+```
+
+Show seconds since the last renewal:
+
+```promql
+time() - kube_lease_renew_time{namespace="<namespace>", lease="rollout-operator"}
+```
+
+Compare renewal age with the configured Lease duration, allowing for scrape delay. A holder label can remain after a leader has failed, so use renewal age, operator logs, and Service endpoints to investigate whether that instance is still serving webhooks. Missing metrics can indicate a collector, RBAC, or scrape problem; they do not prove that there is no leader.
+
+## Alerts
+
+### IncorrectWebhookConfigurationFailurePolicy
+
+This alert fires when one of the validating webhooks used by the rollout-operator has its failure policy set to `Ignore`.
+
+In normal operations the failure policy should be set to `Fail`.
+
+```
+kind: ValidatingWebhookConfiguration
+...
+  failurePolicy: Fail
+```
+
+How it **works**:
+
+- This alert checks on the configured failure policy of the `pod-eviction` and `zpdb-validation` validating webhooks via the `kube_validating_webhook_failure_policy` metric
+- Although it may be valid to temporarily enable an `Ignore` failure mode, normal operations should have the failure mode set to `Fail`
+- When in `Ignore` mode the Kubernetes API server ignores a webhook failure if the webhook is unavailable or can not be reached
+- This would result in the zone aware pod disruption budget not being enforced or the ZPDB configuration validator not being enforced if the rollout-operator is not running
+
+How to **investigate**:
+
+- Review the configuration of the `pod-eviction` and `zpdb-configuration` webhooks:
+  - `kubectl -n <namespace> get ValidatingWebhookConfigurations zpdb-validation-<namespace> -o yaml`
+  - `kubectl -n <namespace> get ValidatingWebhookConfigurations pod-eviction-<namespace> -o yaml`
+- Update the configuration to use a `Fail` policy. See Jsonnet configuration options `ignore_rollout_operator_zpdb_eviction_webhook_failures` and `ignore_rollout_operator_zpdb_validation_webhook_failures` in [rollout-operator.libsonnet](https://github.com/grafana/rollout-operator/blob/main/operations/rollout-operator/rollout-operator.libsonnet).
+
+### BadZoneAwarePodDisruptionBudgetConfiguration
+
+This alert fires when the zone aware pod disruption budget configuration validating webhook observes an invalid ZPDB object.
+
+This indicates that a malformed configuration has been applied, or an invalid configuration already exists when the rollout-operator starts.
+
+How it **works**:
+
+- Under normal circumstances, there is a `zpdb-validation` validating webhook that should prevent ZPDBs with invalid configuration from being accepted by the Kubernetes control plane
+- However, if the validating webhook did not reject the invalid ZPDB for some reason, then the rollout-operator will reject and ignore the invalid ZPDB, so the ZPDB will not be effective, and this alert will fire
+- The invalid ZPDB could have been accepted for a number of reasons, including:
+  - The validating webhook was not installed correctly when the invalid ZPDB was stored
+  - The validating webhook's failure policy was set to `Ignore` instead of `Fail`
+
+How to **investigate**:
+
+- Review the `zpdb-validation` `ValidatingWebhookConfiguration` and ensure its failure policy is set to `Fail`:
+  `kubectl -n <namespace> get ValidatingWebhookConfigurations zpdb-validation-<namespace> -o yaml`
+- Review the `ZPDB` configurations and verify they are valid
+  `kubectl -n <namespace> get zpdb <name> -o yaml`
+
+### HighNumberInflightZpdbRequests
+
+This alert fires when there has been a sustained number of in-flight pod eviction requests for a given period of time.
+
+This indicates that there is likely an issue causing a delay in the pod eviction consideration process.
+
+How it **works**:
+
+- The `pod-eviction` `ValidatingWebhookConfiguration` routes voluntary pod eviction requests into the ZPDB eviction controller
+- The rollout controller also uses the ZPDB eviction controller to test if a pod can be updated (as part of rolling updates)
+- The `ZPDB` eviction controller serializes these requests, such that only one pod is considered at a time. Other requests are queued
+- The `ZPDB` eviction controller relies on the Kubernetes API to query for status on StatefulSets and Pods
+
+How to **investigate**:
+
+- Review the rollout-operator logs (or trace) to gain insight into what may be causing a delay or blockage in the `ZPDB` eviction controller
+- Use caution with restarting the rollout-operator pod. It maintains internal state of recently evicted pods
+  - There is a short window of time from when an eviction request is allowed to the pod transitioning to a state where it will report as not ready
+  - The rollout-operator maintains an in-memory cache of these recently evicted pods to compensate for the pod still reporting as ready after its eviction request has been allowed
+  - In normal circumstances with the pod eviction webhook failure policy set to `Fail`, by the time a rollout-operator pod has been restarted the recently evicted pod states will be correctly reconciled
+  - But if pods have been evicted with a failure policy of `Ignore` then there is a small possibility for a race condition which can result in a ZPDB breach
+- Ensure that the `pod-eviction` and `zpdb-validation` `ValidatingWebhookConfiguration` have a failure policy set to `Fail` before restarting the rollout-operator
+
+### rollout-operatorKubernetesAPIClientRateLimited
+
+This alert fires when the rollout-operator has been unable to send Kubernetes API requests because its own client-side rate limiter is exhausted.
+
+There is no healthy non-zero level for this: a request which fails to acquire a token is never sent at all, and the caller sees it as a failure. A sustained rate means the rate limiter, rather than the Kubernetes API, is the bottleneck.
+
+How it **works**:
+
+- The rollout-operator rate limits its calls to the Kubernetes API with a separate token bucket per API group, defaulting to `5` QPS and a burst of `10` per group. Each component (the core controller, and the pod-eviction, no-downscale and prepare-downscale webhooks) gets its own dedicated client with its own independent set of buckets, all at that same configured QPS
+- `rollout_operator_kubernetes_api_client_rate_limited_requests_total` counts requests which waited for a token until they exceeded their context deadline, labelled by `api_group` and `component`
+- The alert fires on any sustained rate, held for 15 minutes so that a momentary burst does not page
+- The effect is self-sustaining: eviction requests which time out are retried, which deepens the queue, so it does not usually recover on its own until the eviction rate drops
+
+How to **investigate**:
+
+- Identify the saturated API group and component from the `api_group` and `component` labels. The pod-eviction component's `core` and `apps` groups are the ones the eviction path uses
+- Review the rollout-operator error logs. Note that once the queue is deep enough, requests stop reaching the limiter's rejection path and time out without the `client-side rate limiter` marker, so searching for that string alone under-reports the problem. See [Recognising exhaustion](#recognising-exhaustion) for the log forms to expect
+- Check `rollout_operator_zpdb_inflight_eviction_requests`. It settles near `QPS × webhook deadline`, so a value stuck around 45 with the default limits indicates a fully saturated bucket
+- Establish what is driving the eviction volume. Rollout-operator rolls pods out sequentially, so a rolling update is not a source of concurrency here; the usual cause is a large-scale node drain - node pressure, or a cluster autoscaler consolidating - evicting many pods across many zones at once
+- To mitigate, either reduce the eviction concurrency at its source, or raise the limits. See [Kubernetes API client rate limiting](#kubernetes-api-client-rate-limiting)
+
+### rollout-operatorKubernetesAPIClientApproachingRateLimit
+
+This alert fires when a rollout-operator component is sustaining over 80% of its own configured client-side rate limit for a given Kubernetes API group. It is an earlier, lower-urgency warning than [rollout-operatorKubernetesAPIClientRateLimited](#rollout-operatorkubernetesapiclientratelimited): nothing is being dropped yet, but that component is close enough to its ceiling that a small increase in load would start rejecting requests.
+
+How it **works**:
+
+- The token bucket is per-process _and_ per-component (see [Kubernetes API client rate limiting](#kubernetes-api-client-rate-limiting)), so the alert compares each pod's _and_ component's own throughput against its own limit, never a sum across pods or across components. Summing across components in particular would let a genuinely idle component hide one running hot, since they all share the same nominal QPS but have entirely independent buckets
+- `rollout_operator_kubernetes_api_client_rate_limit_qps` publishes the configured `-kubernetes.client-qps` value per component, but only while rate limiting is actually enabled for it (`qps` and `burst` both positive). Where it is disabled, the metric is absent and this alert cannot fire for that component - there is no ceiling to approach
+- The alert fires on throughput exceeding 80% of that limit, held for 10 minutes so a momentary burst does not page
+
+How to **investigate**:
+
+- Identify the pod, component and API group approaching its limit from the `pod`, `component` and `api_group` labels
+- Establish what is driving the load the same way as for the saturation alert: usually a large-scale node drain rather than a rolling update, since rollout-operator rolls pods out sequentially
+- Since this fires before anything is actually being dropped, there is more room to act before impact: reduce the load at its source, or raise the limits. See [Kubernetes API client rate limiting](#kubernetes-api-client-rate-limiting)
+- If it keeps firing without ever tipping into the saturation alert, the limit may simply be sized close to normal peak load - consider raising it rather than treating every firing as an incident
+
+### rollout-operatorZpdbConfigObserverNotReady
+
+This alert fires when `rollout_operator_zpdb_config_observer_ready` remains `0` for 5 minutes. Only the leader exports this metric. It is disabled by default; enable it with `rollout_operator_zpdb_config_observer_alert_enabled` where ZPDBs are used.
+
+The observer cannot access the ZPDB resource or has not synchronized its configuration, so ZPDB configuration changes may not be applied to eviction decisions. If the operator started with `-kubernetes.allow-missing-crds=true` without the ZPDB CRD, ZPDB protection is inactive and evictions are allowed without ZPDB checks. Other Kubernetes admission checks and PodDisruptionBudgets still apply.
+
+How to **investigate**:
+
+- Verify that `zoneawarepoddisruptionbudgets.rollout-operator.grafana.com` is installed and established:
+  `kubectl get crd zoneawarepoddisruptionbudgets.rollout-operator.grafana.com`
+- Check operator logs for `zpdb config observer watch failed`. Check Kubernetes API availability and the service account's list/watch permissions for ZPDB resources.
+- Apply the CRD and required ZPDB objects in the namespace managed by the operator. Recovery is automatic and requires no restart.
+- Wait for the readiness metric to return to `1`. Observer readiness alone does not guarantee that a matching, valid ZPDB exists.
+- Avoid voluntary disruptions requiring ZPDB protection until recovery has been verified.
+
+### rollout-operatorReplicaTemplateObserverNotReady
+
+This alert fires when `rollout_operator_replica_template_observer_ready` remains `0` for 5 minutes. It is disabled by default; enable it with `rollout_operator_replica_template_observer_alert_enabled` where ReplicaTemplates are used.
+
+The operator cannot discover the ReplicaTemplate resource and its `/scale` subresource. When ReplicaTemplate watches are enabled, readiness also requires initial cache synchronization and successful list/watch requests. StatefulSets referencing ReplicaTemplates may be unable to mirror their replica counts; pod rollouts continue.
+
+How to **investigate**:
+
+- Verify that `replicatemplates.rollout-operator.grafana.com` is installed and established, and that the CRD exposes its scale subresource:
+  `kubectl get crd replicatemplates.rollout-operator.grafana.com -o yaml`
+- Check Kubernetes API discovery access and availability. With watches enabled, check namespace list/watch permissions and `ReplicaTemplate watch failed` in the operator logs.
+- With `-kubernetes.allow-missing-crds=true`, apply the CRD and referenced ReplicaTemplates in the namespace managed by the operator; discovery triggers reconciliation without a restart.
+- Discovery is checked every 30 seconds. Verify that the readiness metric returns to `1` and replica mirroring resumes. This metric does not guarantee that a referenced ReplicaTemplate exists or that its scale/status subresources are accessible.
+
+## Metrics
+
+A Prometheus metrics endpoint is available at `/metrics` of the rollout-operator deployment.
+
+### kube_validating_webhook_failure_policy
+
+This metric reports on the current configuration of validating and mutating webhook failure policy configurations.
+
+Labels are used to indicate the policy mode (`Fail` or `Ignore`) and the webhook details. A value of `1` indicates that this is the current setting.
+
+Use this metric to monitor that the webhooks have been correctly configured.
+
+### rollout_operator_zpdb_configurations_observed_total
+
+This counter metric reports on the total number of `ValidatingWebhookConfiguration` configurations which have been `updated` (including additions) or `deleted`.
+
+It also tracks the number of `ignored` and `invalid` configuration updates.
+
+A configuration will be `ignored` if it is a stale update or an update in an unexpected format.
+
+A configuration will be `invalid` if it fails a validation process.
+
+Use this metric to monitor for changes to the `ZPDB` configurations and to monitor for unexpected `invalid` configurations being observed. This may indicate an error in the generation of these configurations.
+
+### rollout_operator_zpdb_eviction_requests_total
+
+This counter metric reports on the total number of pod eviction requests.
+
+This includes both pod eviction requests which come in via the pod eviction webhook, and pod deletion requests which come from the rollout controller (StatefulSet pod updates).
+
+Note that the number of requests arriving via the pod eviction webhook can be tracked with the `rollout_operator_kubernetes_api_client_request_duration_seconds` histogram's count: `rollout_operator_kubernetes_api_client_request_duration_seconds_count` if scraped as a classic histogram, or `histogram_count(rollout_operator_kubernetes_api_client_request_duration_seconds)` if scraped as a native histogram. Whether this cell exposes the classic `_count`/`_sum`/`_bucket` series or only the native form depends on its Prometheus/Mimir scrape config.
+
+Use this metric to monitor for abnormal request volume and/or frequency.
+
+### rollout_operator_zpdb_inflight_eviction_requests
+
+This is a gauge metric which tracks the number of in-flight pod eviction requests.
+
+Like `rollout_operator_zpdb_eviction_requests_total`, this metrics takes both eviction requests which come in via the pod eviction webhook, and pod deletion requests which come from the rollout controller (StatefulSet pod updates).
+
+Note that the number of in-flight requests via the pod eviction webhook can be tracked with the `rollout_operator_inflight_requests` metric.
+
+Use this metric to monitor for abnormal high volumes of in-flight requests. Since these eviction requests should return quickly, even a small number of sustained in-flight requests is likely indicative of an issue.
+
+Check that the rollout-operator error logs to gain insight into why the eviction is being delayed.
+
+### kube_customresource_zpdb_spec_max_unavailable
+
+This is a gauge metric which tracks the configured max unavailable setting for each rollout-group. For instance `kube_customresource_zpdb_spec_max_unavailable{name="ingester-rollout"}`.
+
+Use this metric to track that your `ZPDB` configurations are correctly set to the expected value.
+
+## Configuration
+
+See [rollout-operator.libsonnet](https://github.com/grafana/rollout-operator/blob/main/operations/rollout-operator/rollout-operator.libsonnet).
+
+### Webhook failure policies
+
+The following Jsonnet flags can be set to toggle the webhook failure modes. These should be used with caution.
+
+Setting these to `true` will result in the Kubernetes API server proceeding if the webhook is not reachable / rollout-operator pod is not running.
+
+```jsonnet
+_config+:: {
+    ignore_rollout_operator_no_downscale_webhook_failures: true|false,
+    ignore_rollout_operator_prepare_downscale_webhook_failures: true|false,
+    ignore_rollout_operator_zpdb_validation_webhook_failures: true|false,
+    ignore_rollout_operator_zpdb_eviction_webhook_failures: true|false
+```
+
+Note that if you are using the rollout-operator [Helm chart](https://github.com/grafana/helm-charts/tree/main/charts/rollout-operator) there are equivalent [values](https://github.com/grafana/helm-charts/blob/main/charts/rollout-operator/values.yaml) for changing the webhook failure policies.
+
+### Kubernetes API client rate limiting
+
+The rollout-operator rate limits its own calls to the Kubernetes API, with a separate token bucket per API
+group (`core`, `apps`, and so on). The defaults are `5` QPS and a burst of `10` per group.
+
+Each admission webhook and the core controller get their own client, so an overloaded webhook exhausts only
+its own buckets. Within one webhook, however, the bucket is shared by every request it is serving. This is
+`component` on the relevant metrics: `core-controller`, `pod-eviction`, `no-downscale`, `prepare-downscale`.
+
+The default values can be overridden such as;
+
+```jsonnet
+rollout_operator_args+:: {
+    'kubernetes.client-qps': 20,
+    'kubernetes.client-burst': 40,
+}
+```
+
+Increasing these values will place additional load onto the Kubernetes API server.
+
+The rate limits can be disabled with;
+
+```jsonnet
+rollout_operator_args+:: {
+    'kubernetes.client-qps': 0,
+}
+```
+
+#### Recognising exhaustion
+
+When a bucket is exhausted, requests queue for a token until they would exceed their context deadline, at
+which point they are rejected without being sent. The rejection surfaces wrapped in whatever the caller was
+trying to do, so the same root cause appears under several different `reason` values.
+
+Pod `Get` for the pod being evicted, on the `core` group:
+
+```
+level=error method=admission.PodEviction() object.name=store-gateway-zone-b-243 object.namespace=<namespace>
+  msg="pod eviction denied" reason="unable to find pod by name"
+  err="Get \"https://<apiserver>/api/v1/namespaces/<namespace>/pods/store-gateway-zone-b-243?timeout=5m0s\":
+  client-side rate limiter for Kubernetes API group \"core\": rate: Wait(n=1) would exceed context deadline"
+```
+
+StatefulSet `List` to find the other zones in the rollout group, on the `apps` group:
+
+```
+level=error method=admission.PodEviction() object.name=store-gateway-zone-b-1 object.namespace=<namespace>
+  owner=store-gateway-zone-b msg="pod eviction denied"
+  reason="unable to find related stateful sets - a minimum of 2 StatefulSets is required"
+  err="Get \"https://<apiserver>/apis/apps/v1/namespaces/<namespace>/statefulsets?labelSelector=poddisruptionbudget-group%3Dnon-spot-store-gateway\":
+  client-side rate limiter for Kubernetes API group \"apps\": rate: Wait(n=1) would exceed context deadline"
+```
+
+Once the pile-up is deep enough, requests stop reaching the limiter's rejection path and simply run out of
+time, losing the `client-side rate limiter` marker altogether:
+
+```
+level=error method=admission.PodEviction() object.name=ingester-zone-b-503 object.namespace=<namespace>
+  msg="pod eviction denied" reason="unable to find pod owner"
+  err="unable to find StatefulSet ingester-zone-b by name:
+  Get \"https://<apiserver>/apis/apps/v1/namespaces/<namespace>/statefulsets/ingester-zone-b?timeout=5m0s\": context deadline exceeded"
+```
+
+The last form is the one to watch for, because searching only for `client-side rate limiter` will
+under-report how bad things are.
+
+Confirm with the metrics rather than the logs alone:
+
+- `rollout_operator_kubernetes_api_client_rate_limited_requests_total` counts requests which failed to
+  acquire a token, by `api_group`. Any sustained rate here means the limiter is the bottleneck.
+- `rollout_operator_kubernetes_api_client_request_duration_seconds` counts only the requests which did get a
+  token. If its rate is pinned flat at the configured QPS, the bucket is saturated.
+- `rollout_operator_zpdb_inflight_eviction_requests` will sit at a sustained non-zero level as evictions
+  queue. It settles near `QPS × webhook deadline`, so a value stuck around 45 with the defaults is a
+  fully saturated `core` bucket.
+
+The effect is self-sustaining: evictions that time out are retried, which deepens the queue. It does not
+recover on its own until the eviction rate drops.
+
+### Disable voluntary pod evictions
+
+This example illustrates using a `mimir` identifier.
+
+```jsonnet
+ingester_rollout_pdb+:
+  local podDisruptionBudget = $.policy.v1.podDisruptionBudget;
+  podDisruptionBudget.mixin.spec.withMaxUnavailable(0),
+```
+
+### Cross-zone eviction delays
+
+The `crossZoneEvictionDelay` can be used in partition-aware `ZPDB` configurations and requires `podNamePartitionRegex` to be set.
+
+It requires a minimum period to elapse after a pod returns to ready+running before another pod in the same partition (in any zone) can be evicted.
+
+For instance;
+
+- t0 - `pod-zone-a-0` is evicted
+- t1 - `pod-zone-a-0` returns to full service (ready and running)
+- t2 - `pod-zone-b-0` is tested for eviction
+
+Assuming the PDB `max-unavailable` is 1, the `pod-zone-b-0` eviction will not be allowed until at least `crossZoneEvictionDelay` has elapsed since t1 (i.e. `t2 - t1 >= crossZoneEvictionDelay`).
+
+Note that this duration is calculated from when the `pod-zone-a-0` becomes ready, not when it was evicted.
+
+When `crossZoneEvictionDelay` is unset or `0`, no delay is enforced and evictions follow the standard ZPDB logic.
+
+The ready time comes from the Pod `Ready` condition's `lastTransitionTime`, which is stored in Pod status and survives
+`rollout-operator` restarts. If Kubernetes does not provide a usable transition time, pod evictions within the same partition
+are denied while the delay is configured.
+
+The kubelet and `rollout-operator` node clocks must be synchronized.
+
+This can be monitored in the `rollout-operator` logs via the message `Pod not considered ready - not enough time has elapsed since this pod became ready`.

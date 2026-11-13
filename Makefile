@@ -1,0 +1,213 @@
+# Local settings (optional).
+# WARNING: do not commit to a repository!
+-include Makefile.local
+
+# Generate the default image tag based on the git branch and revision.
+GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
+GIT_REVISION := $(shell git rev-parse --short HEAD)
+
+IMAGE_PREFIX ?= grafana
+IMAGE_TAG ?= $(subst /,-,$(GIT_BRANCH))-$(GIT_REVISION)
+# Optional second tag applied on publish (e.g. main-<datetime>-<sha> from CI).
+ADDITIONAL_IMAGE_TAG ?=
+ADDITIONAL_IMAGE_TAG_FLAG = $(if $(ADDITIONAL_IMAGE_TAG),-t $(IMAGE_PREFIX)/rollout-operator:$(ADDITIONAL_IMAGE_TAG),)
+
+# Support gsed on OSX (installed via brew), falling back to sed. On Linux
+# systems gsed won't be installed, so will use sed as expected.
+SED ?= $(shell which gsed 2>/dev/null || which sed)
+
+export GOFIPS140 := v1.26.0
+
+GOOS ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+
+DONT_FIND := -name vendor -prune -o -name .git -prune -o -name .cache -prune -o -name .pkg -prune
+GO_FILES := $(shell find . $(DONT_FIND) -o -type f -name '*.go' -print)
+MAKE_FILES := $(shell find . $(DONT_FIND) -o -name 'Makefile' -print -o -name '*.mk' -print)
+
+MIXIN_PATH := operations/rollout-operator-mixin
+MIXIN_OUT_PATH ?= operations/rollout-operator-mixin-compiled
+
+DOC_SOURCES_PATH := docs
+
+.DEFAULT_GOAL := rollout-operator
+
+REGO_POLICIES_PATH=operations/policies
+
+CRD_PATHS := $(wildcard operations/rollout-operator/crds/*.yaml)
+CRD_BASE_REF ?= $(shell git merge-base HEAD origin/main)
+CRDIFY ?= crdify
+
+# path to jsonnetfmt
+JSONNET_FMT := jsonnetfmt
+
+# path to the rollout-operator manifests
+JSONNET_MANIFESTS_PATHS := operations
+
+# Adapted from https://www.thapaliya.com/en/writings/well-documented-makefiles/
+.PHONY: help
+help: ## Display this help and any documented user-facing targets
+	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_\.\-\/%]+:.*?##/ { printf "  %-45s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+rollout-operator: $(GO_FILES) ## Build the rollout-operator binary
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' ./cmd/rollout-operator
+
+.PHONY: status-ui-preview
+status-ui-preview: ## Serve the status UI with demo data on 127.0.0.1:8080
+	go run ./cmd/status-ui-preview
+
+.PHONY: build-image
+build-image: clean ## Build the rollout-operator image
+	docker buildx build --load --platform linux/$(GOARCH) --build-arg revision=$(GIT_REVISION) -t rollout-operator:latest -t rollout-operator:$(IMAGE_TAG) .
+
+.PHONY: build-test-images
+build-test-images: build-image integration/mock-service/.uptodate ## Build both rollout-operator and mock-service images for testing
+
+.PHONY: publish-images
+publish-images: clean ## Build and publish the rollout-operator image
+	docker buildx build --push --platform linux/amd64,linux/arm64 --build-arg revision=$(GIT_REVISION) -t $(IMAGE_PREFIX)/rollout-operator:$(IMAGE_TAG) $(ADDITIONAL_IMAGE_TAG_FLAG) .
+
+.PHONY: release-notes 
+release-notes: ## Generate the release notes for a GitHub release
+	@echo "Docker image: \`${IMAGE_PREFIX}/rollout-operator:${IMAGE_TAG}\`\n\n## Changelog"
+	@awk -v var="${IMAGE_TAG}" '$$0 ~ "## "var {flag=1; next} /^##/{flag=0} flag' CHANGELOG.md
+
+.PHONY: test
+test: ## Run tests
+	go test ./...
+
+.PHONY: check-kind
+check-kind: ## Check if kind is installed
+	@which kind >/dev/null 2>&1 || (echo "Error: kind binary not found. Please install kind: https://kind.sigs.k8s.io/docs/user/quick-start/#installation" && exit 1)
+
+# Optional CI sharding: SHARD_INDEX=0 SHARD_COUNT=2 make integration
+SHARD_INDEX ?= 0
+SHARD_COUNT ?= 1
+
+.PHONY: integration
+integration: ## Run integration tests (set SHARD_INDEX/SHARD_COUNT to split across runners)
+integration: check-kind integration/mock-service/.uptodate
+	SHARD_INDEX=$(SHARD_INDEX) SHARD_COUNT=$(SHARD_COUNT) ./tools/run-integration-tests.sh
+
+integration/mock-service/.uptodate:
+	GOOS=linux GOARCH=$(GOARCH) CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ./integration/mock-service/mock-service ./integration/mock-service
+	docker buildx build --load --platform linux/$(GOARCH) --build-arg revision=$(GIT_REVISION) -t mock-service:latest -f ./integration/mock-service/Dockerfile ./integration/mock-service
+
+.PHONY: lint
+lint: ## Run lints to check for style issues.
+lint: check-makefiles doc-lint
+	golangci-lint run --timeout=5m
+
+.PHONY: fix-lint
+fix-lint: ## Automatically fix linting issues where possible
+	golangci-lint run --timeout=5m --fix
+
+.PHONY: doc-lint
+doc-lint: 
+	misspell -error $(DOC_SOURCES_PATH)
+
+.PHONY: clean
+clean: ## Run go clean and remove the rollout-operator binary
+	rm -f rollout-operator integration/mock-service/mock-service
+	rm -rf integration/jsonnet-integration-tests
+	go clean ./...
+
+.PHONY: check-jsonnet-manifests
+check-jsonnet-manifests: ## Check the rollout-operator manifests.
+check-jsonnet-manifests: format-jsonnet
+	@echo "Checking diff:"
+	@./tools/find-diff-or-untracked.sh $(JSONNET_MANIFESTS_PATHS) || (echo "Please format jsonnet by running 'make format-jsonnet'" && false)
+
+.PHONY: check-crd-compatibility
+check-crd-compatibility: ## Check CRDs for backward-incompatible schema changes.
+	@test -n "$(CRD_BASE_REF)" || (echo "CRD_BASE_REF is required" >&2 && false)
+	@for crd in $(CRD_PATHS); do \
+		if ! git cat-file -e "$(CRD_BASE_REF):$$crd" 2>/dev/null; then \
+			echo "Skipping new CRD $$crd"; \
+			continue; \
+		fi; \
+		echo "Checking $$crd against $(CRD_BASE_REF)"; \
+		$(CRDIFY) "git://$(CRD_BASE_REF)?path=$$crd" "file://$$crd" || exit 1; \
+	done
+
+.PHONY: format-jsonnet
+format-jsonnet: ## Format the rollout-operator manifests.
+	@find $(JSONNET_MANIFESTS_PATHS) -type f -name '*.libsonnet' -print -o -name '*.jsonnet' -print | xargs $(JSONNET_FMT) -i
+
+.PHONY: build-jsonnet-tests
+build-jsonnet-tests: ## Build the rollout-operator tests.
+	@./operations/rollout-operator-tests/build.sh
+
+.PHONY: check-jsonnet-tests
+check-jsonnet-tests: ## Check the jsonnet tests output.
+check-jsonnet-tests: build-jsonnet-tests jsonnet-conftest-test
+	@./tools/find-diff-or-untracked.sh operations/rollout-operator-tests || (echo "Please rebuild jsonnet tests output 'make build-jsonnet-tests'" && false)
+
+.PHONY: jsonnet-conftest-quick-test
+jsonnet-conftest-quick-test: ## Does not rebuild the yaml manifests, use the target jsonnet-conftest-test for that
+jsonnet-conftest-quick-test:
+	@./operations/rollout-operator-tests/run-conftest.sh --policies-path $(REGO_POLICIES_PATH) --manifests-path ./operations/rollout-operator-tests
+
+.PHONY: jsonnet-conftest-test
+jsonnet-conftest-test: build-jsonnet-tests jsonnet-conftest-quick-test
+
+.PHONY: check-vendor
+check-vendor: ## Verify the module cache against go.sum and that vendor/ matches go.mod/go.sum.
+	go mod vendor
+	go mod verify
+	@./tools/find-diff-or-untracked.sh vendor go.mod go.sum || (echo "Please run 'go mod vendor' and commit the resulting changes" && false)
+
+.PHONY: check-makefiles
+check-makefiles: ## Check the makefiles format.
+check-makefiles:
+	@git diff --exit-code -- $(MAKE_FILES) || (echo "Please format Makefiles by running 'make format-makefiles'" && false)
+
+.PHONY: format-makefiles
+format-makefiles: ## Format all Makefiles.
+format-makefiles: $(MAKE_FILES)
+	$(SED) -i -e 's/^\(\t*\)  /\1\t/g' -e 's/^\(\t*\) /\1/' -- $?
+
+.PHONY: check-mixin
+check-mixin: ## Build, format and check the mixin files.
+check-mixin: build-mixin format-jsonnet check-mixin-jb
+	@echo "Checking diff:"
+	./tools/find-diff-or-untracked.sh $(MIXIN_PATH) "$(MIXIN_OUT_PATH)" || (echo "Please build and format mixin by running 'make build-mixin format-jsonnet'" && false);
+
+.PHONY: check-mixin-jb
+check-mixin-jb:
+	@cd $(MIXIN_PATH) && \
+	jb install
+
+.PHONY: build-mixin
+build-mixin: ## Generates the rollout-operator mixin zip file.
+build-mixin: check-mixin-jb
+	@# Empty the compiled mixin directories content, without removing the directories itself,
+	@# so that Grafana can refresh re-build dashboards when using "make mixin-serve".
+	@echo "Generating compiled dashboard:"
+	@mkdir -p "$(MIXIN_OUT_PATH)"
+	@find "$(MIXIN_OUT_PATH)" -type f -delete;
+	mixtool generate dashboards --directory "$(MIXIN_OUT_PATH)/dashboards" "${MIXIN_PATH}/mixin.libsonnet";
+
+	@mkdir -p "$(MIXIN_OUT_PATH)/alerts"
+	mixtool generate alerts -y --output-alerts "$(MIXIN_OUT_PATH)/alerts/alerts.yaml" "${MIXIN_PATH}/mixin.libsonnet";
+	@echo "sample rollout-operator dashboard generated to $(MIXIN_OUT_PATH)/dashboards"
+
+.PHONY: mixin-serve
+mixin-serve: ## Runs Grafana loading the mixin dashboards.
+	@./operations/rollout-operator-mixin-tools/serve/run.sh -p $(MIXIN_OUT_PATH)
+
+check-doc: ## Check the documentation files are up to date.
+check-doc: doc
+	@find "$(DOC_SOURCES_PATH)" -name "*.md" | xargs git diff --exit-code -- \
+	|| (echo "Please update documentation by running 'make doc' and committing the changes" && false)
+
+.PHONY: doc
+doc:
+	prettier --write "$(DOC_SOURCES_PATH)/*.md"
+
+.PHONY: update-changelog-deps
+update-changelog-deps: ## Update CHANGELOG.md with go dependency changes (requires PR_NUM)
+ifndef PR_NUM
+	$(error PR_NUM is required. Usage example: make update-changelog-deps PR_NUM=123)
+endif
+	@git show $$(git describe --tags --abbrev=0 --match "v*"):go.mod | go run ./tools/update-changelog-deps/main.go --pull-request-number="$(PR_NUM)"

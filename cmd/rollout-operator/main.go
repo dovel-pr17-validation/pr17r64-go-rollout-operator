@@ -1,0 +1,782 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	_ "net/http/pprof" // anonymous import to get the pprof handler registered
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/google/uuid"
+	"github.com/grafana/dskit/clusterutil"
+	"github.com/grafana/dskit/middleware"
+	"github.com/grafana/dskit/tracing"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/model"
+	"go.uber.org/atomic"
+	v1 "k8s.io/api/admission/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp" // Required to get the GCP auth provider working.
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/scale"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+
+	"github.com/grafana/rollout-operator/pkg/admission"
+	"github.com/grafana/rollout-operator/pkg/controller"
+	"github.com/grafana/rollout-operator/pkg/frontend"
+	"github.com/grafana/rollout-operator/pkg/instrumentation"
+	"github.com/grafana/rollout-operator/pkg/status"
+	"github.com/grafana/rollout-operator/pkg/tlscert"
+	"github.com/grafana/rollout-operator/pkg/webhooks"
+	"github.com/grafana/rollout-operator/pkg/zpdb"
+)
+
+const defaultServerSelfSignedCertExpiration = model.Duration(365 * 24 * time.Hour)
+
+const deprecatedZPDBPodReadyAnnotationPatchTimeoutFlag = "zpdb.pod-ready-annotation-patch-timeout"
+
+var (
+	defaultClusterValidationExcludePaths = []string{"admission/no-downscale", "admission/prepare-downscale", "ui"}
+)
+
+type config struct {
+	logFormat string
+	logLevel  string
+
+	serverPort           int
+	kubeAPIURL           string
+	kubeConfigFile       string
+	kubeClusterDomain    string
+	kubeNamespace        string
+	kubeClientTimeout    time.Duration
+	kubeClientQPS        float64
+	kubeClientBurst      int
+	podClientTimeout     time.Duration
+	reconcileInterval    time.Duration
+	clusterValidationCfg clusterutil.ClusterValidationProtocolConfigForHTTP
+
+	watchReplicaTemplates bool
+	allowMissingCRDs      bool
+
+	kubePodName                 string
+	leaderElectionEnabled       bool
+	leaderElectionLeaseName     string
+	leaderElectionLeaseDuration time.Duration
+	leaderElectionRenewDeadline time.Duration
+	leaderElectionRetryPeriod   time.Duration
+
+	serverTLSEnabled        bool
+	serverTLSPort           int
+	serverCertFile          string
+	serverKeyFile           string
+	serverTLSRequestTimeout time.Duration
+
+	serverSelfSignedCert           bool
+	serverSelfSignedCertSecretName string
+	serverSelfSignedCertDNSName    string
+	serverSelfSignedCertOrg        string
+	serverSelfSignedCertExpiration model.Duration
+
+	updateWebhooksWithSelfSignedCABundle bool
+
+	useZoneTracker           bool
+	zoneTrackerConfigMapName string
+
+	deprecatedZPDBPodReadyAnnotationPatchTimeout time.Duration
+}
+
+func (cfg *config) register(fs *flag.FlagSet) {
+	fs.StringVar(&cfg.logFormat, "log.format", "logfmt", "The log format. Supported values: logfmt, json. Defaults to logfmt.")
+	fs.StringVar(&cfg.logLevel, "log.level", "debug", "The log level. Supported values: debug, info, warn, error.")
+	fs.IntVar(&cfg.serverPort, "server.port", 8001, "Port to use for exposing instrumentation, readiness probe, and status UI endpoints.")
+	fs.StringVar(&cfg.kubeAPIURL, "kubernetes.api-url", "", "The Kubernetes server API URL. If not specified, it will be auto-detected when running within a Kubernetes cluster.")
+	fs.StringVar(&cfg.kubeConfigFile, "kubernetes.config-file", "", "The Kubernetes config file path. If not specified, it will be auto-detected when running within a Kubernetes cluster.")
+	fs.DurationVar(&cfg.kubeClientTimeout, "kubernetes.client-timeout", 5*time.Minute, "HTTP client timeout. This applies to requests issued to both the Kubernetes API and Kubernetes resource endpoints. It does not apply to HTTP requests issued directly to pod endpoints (e.g. prepare-downscale): those are governed by -pods.client-timeout.")
+	fs.Float64Var(&cfg.kubeClientQPS, "kubernetes.client-qps", 5, "Maximum QPS to the Kubernetes API server, enforced per API group: each API group (e.g. core/v1, apps/v1, policy/v1) gets its own token bucket with this QPS. Set to 0 to disable client-side rate limiting.")
+	fs.IntVar(&cfg.kubeClientBurst, "kubernetes.client-burst", 10, "Maximum burst (token bucket capacity) for the per-API-group rate limiter (see -kubernetes.client-qps). Must be at least 1 when rate limiting is enabled, since each request consumes one token. It does not need to be greater than or equal to the QPS: a smaller burst simply allows less bursting.")
+	fs.DurationVar(&cfg.podClientTimeout, "pods.client-timeout", 5*time.Second, "HTTP client timeout for requests issued directly to pod endpoints (e.g. prepare-downscale). These calls do not go through the Kubernetes API, so they are not subject to -kubernetes.client-timeout nor the client-side rate limiter.")
+	fs.StringVar(&cfg.kubeClusterDomain, "kubernetes.cluster-domain", "cluster.local.", "The Kubernetes cluster domain.")
+	fs.StringVar(&cfg.kubeNamespace, "kubernetes.namespace", "", "The Kubernetes namespace for which this operator is running.")
+	fs.DurationVar(&cfg.reconcileInterval, "reconcile.interval", 5*time.Second, "The minimum interval of reconciliation.")
+	fs.BoolVar(&cfg.allowMissingCRDs, "kubernetes.allow-missing-crds", false, "Allow startup without the ZPDB CRD or an enabled ReplicaTemplate watch. ZPDB protection is inactive until its CRD is available.")
+	fs.BoolVar(&cfg.watchReplicaTemplates, "replica-templates.watch-enabled", false, "Watch ReplicaTemplates for desired replica changes. Requires the CRD and namespace list/watch permissions.")
+	cfg.clusterValidationCfg.RegisterFlagsWithPrefix("server.cluster-validation.http.", fs)
+
+	fs.StringVar(&cfg.kubePodName, "kubernetes.pod-name", os.Getenv("POD_NAME"), "Name of this pod, used to select the elected leader for webhook traffic. Defaults to POD_NAME or the hostname.")
+	fs.BoolVar(&cfg.leaderElectionEnabled, "leader-election.enabled", false, "Enable Lease leader election. Requires Lease access and pod patch permissions, and a webhook Service selecting the leader label.")
+	fs.StringVar(&cfg.leaderElectionLeaseName, "leader-election.lease-name", "rollout-operator", "Name of the Lease used to ensure only one rollout-operator is active in the namespace.")
+	fs.DurationVar(&cfg.leaderElectionLeaseDuration, "leader-election.lease-duration", 15*time.Second, "Duration that non-leaders wait before attempting to acquire an unrenewed leader election Lease.")
+	fs.DurationVar(&cfg.leaderElectionRenewDeadline, "leader-election.renew-deadline", 10*time.Second, "Duration that the leader retries refreshing its Lease before giving up leadership.")
+	fs.DurationVar(&cfg.leaderElectionRetryPeriod, "leader-election.retry-period", 2*time.Second, "Interval between attempts to acquire or renew the leader election Lease.")
+
+	fs.BoolVar(&cfg.serverTLSEnabled, "server-tls.enabled", false, "Enable TLS server for webhook connections.")
+	fs.IntVar(&cfg.serverTLSPort, "server-tls.port", 8443, "Port to use for exposing TLS server for webhook connections (if enabled).")
+	fs.StringVar(&cfg.serverCertFile, "server-tls.cert-file", "", "Path to the TLS certificate file if not using the self-signed certificate.")
+	fs.StringVar(&cfg.serverKeyFile, "server-tls.key-file", "", "Path to the TLS private key file if not using the self-signed certificate.")
+	fs.DurationVar(&cfg.serverTLSRequestTimeout, "server-tls.request-timeout", 10*time.Second, "Time budget to handle a single TLS server (admission webhook) request: used as the server read and write timeouts, and (at 90%) as the deadline imposed on the request context passed to the webhook handler. Should be smaller than the apiserver's webhook timeout so the rollout-operator responds before the apiserver gives up.")
+
+	fs.BoolVar(&cfg.serverSelfSignedCert, "server-tls.self-signed-cert.enabled", true, "Generate a self-signed certificate for the TLS server.")
+	fs.StringVar(&cfg.serverSelfSignedCertSecretName, "server-tls.self-signed-cert.secret-name", "rollout-operator-self-signed-certificate", "Secret name to store the self-signed certificate (if enabled).")
+	fs.StringVar(&cfg.serverSelfSignedCertDNSName, "server-tls.self-signed-cert.dns-name", "", "DNS name to use for the self-signed certificate (if enabled). If left empty, then 'rollout-operator.<namespace>.svc' will be used.")
+	fs.StringVar(&cfg.serverSelfSignedCertOrg, "server-tls.self-signed-cert.org", "Grafana Labs", "Organization name to use for the self-signed certificate (if enabled).")
+	fs.Var(&cfg.serverSelfSignedCertExpiration, "server-tls.self-signed-cert.expiration", "Expiration time for the self-signed certificate in Prometheus duration format (Go format plus support for days, weeks and years as 1d/1w/1y).")
+	cfg.serverSelfSignedCertExpiration = defaultServerSelfSignedCertExpiration
+
+	fs.BoolVar(&cfg.updateWebhooksWithSelfSignedCABundle, "webhooks.update-ca-bundle", true, "Update the CA bundle in the properly labeled webhook configurations with the self-signed certificate (-server-tls.self-signed-cert.enabled should be enabled).")
+
+	fs.BoolVar(&cfg.useZoneTracker, "use-zone-tracker", false, "Use the zone tracker to prevent simultaneous downscales in different zones")
+	fs.StringVar(&cfg.zoneTrackerConfigMapName, "zone-tracker.config-map-name", "rollout-operator-zone-tracker", "The name of the ConfigMap to use for the zone tracker")
+	fs.DurationVar(&cfg.deprecatedZPDBPodReadyAnnotationPatchTimeout, deprecatedZPDBPodReadyAnnotationPatchTimeoutFlag, 5*time.Second, "Deprecated: accepted for compatibility and has no effect.")
+}
+
+func warnDeprecatedFlags(fs *flag.FlagSet, logger log.Logger) {
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == deprecatedZPDBPodReadyAnnotationPatchTimeoutFlag {
+			level.Warn(logger).Log("msg", "deprecated flag has no effect", "flag", "-"+f.Name)
+		}
+	})
+}
+
+func (cfg config) validate() error {
+	// Validate CLI flags.
+	if cfg.kubeClusterDomain == "" {
+		return errors.New("-kubernetes.cluster-domain cannot be an empty string")
+	}
+	if cfg.kubeNamespace == "" {
+		return errors.New("-kubernetes.namespace has not been specified")
+	}
+	if (cfg.kubeAPIURL == "") != (cfg.kubeConfigFile == "") {
+		return errors.New("either configure both -kubernetes.api-url and -kubernetes.config-file or neither")
+	}
+	if cfg.useZoneTracker && cfg.zoneTrackerConfigMapName == "" {
+		return errors.New("-use-zone-tracker is true, but -zone-tracker.config-map-name has not been specified")
+	}
+	if cfg.kubeClientQPS > 0 && cfg.kubeClientBurst < 1 {
+		return errors.New("-kubernetes.client-burst must be at least 1 when -kubernetes.client-qps is greater than 0, since each request consumes one token")
+	}
+	if cfg.leaderElectionEnabled {
+		if cfg.leaderElectionLeaseName == "" {
+			return errors.New("-leader-election.lease-name cannot be an empty string")
+		}
+		if cfg.leaderElectionLeaseDuration < time.Second {
+			return errors.New("-leader-election.lease-duration must be at least one second")
+		}
+		if cfg.leaderElectionRenewDeadline <= 0 {
+			return errors.New("-leader-election.renew-deadline must be positive")
+		}
+		if cfg.leaderElectionRetryPeriod <= 0 {
+			return errors.New("-leader-election.retry-period must be positive")
+		}
+		serializedLeaseDuration := cfg.leaderElectionLeaseDuration.Truncate(time.Second)
+		if serializedLeaseDuration <= cfg.leaderElectionRenewDeadline {
+			return errors.New("-leader-election.lease-duration, truncated to whole seconds by Kubernetes, must be greater than -leader-election.renew-deadline")
+		}
+		if cfg.leaderElectionRenewDeadline <= time.Duration(leaderelection.JitterFactor*float64(cfg.leaderElectionRetryPeriod)) {
+			return errors.New("-leader-election.renew-deadline must be greater than -leader-election.retry-period multiplied by the client-go jitter factor")
+		}
+	}
+	if cfg.serverTLSRequestTimeout <= 0 {
+		return errors.New("-server-tls.request-timeout must be positive")
+	}
+	if err := cfg.clusterValidationCfg.Validate("http", cfg.kubeNamespace); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func main() {
+	// CLI flags.
+	var cfg config
+	fs := flag.NewFlagSet("rollout-operator", flag.ExitOnError)
+	cfg.register(fs)
+	check(fs.Parse(os.Args[1:]))
+	if len(cfg.clusterValidationCfg.ExcludedPaths) == 0 {
+		// Apply default.
+		cfg.clusterValidationCfg.ExcludedPaths = defaultClusterValidationExcludePaths
+	}
+	check(cfg.validate())
+
+	logger, err := initLogger(cfg.logFormat, cfg.logLevel)
+	check(err)
+	warnDeprecatedFlags(fs, logger)
+
+	reg := prometheus.NewRegistry()
+	metrics := newMetrics(reg)
+	zpdbMetrics := zpdb.NewMetrics(reg)
+
+	ready := atomic.NewBool(false)
+	restart := make(chan string)
+
+	var name string
+	if otelEnvName := os.Getenv("OTEL_SERVICE_NAME"); otelEnvName != "" {
+		name = otelEnvName
+	} else if jaegerEnvName := os.Getenv("JAEGER_SERVICE_NAME"); jaegerEnvName != "" {
+		name = jaegerEnvName
+	} else {
+		name = "rollout-operator"
+	}
+
+	trace, err := tracing.NewOTelOrJaegerFromEnv(name, logger)
+	if err != nil {
+		fatal(fmt.Errorf("failed to set up tracing: %w", err))
+	}
+	defer trace.Close()
+
+	// Expose HTTP endpoints.
+	statusReader := &status.Holder{}
+	statusUI, err := frontend.New(statusReader)
+	check(err)
+
+	srv := newServer(cfg, logger, metrics)
+	srv.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	srv.Handle("/ready", readyHandler(ready))
+	srv.PathPrefix("/debug/pprof").Handler(http.DefaultServeMux)
+	statusUI.Register(srv.Router())
+	check(srv.Start())
+
+	// Build the Kubernetes client config.
+	kubeConfig, err := buildKubeConfig(cfg.kubeAPIURL, cfg.kubeConfigFile)
+	if err != nil {
+		fatal(fmt.Errorf("failed to build Kubernetes client config: %w", err))
+	}
+	if kubeConfig.Timeout == 0 {
+		kubeConfig.Timeout = cfg.kubeClientTimeout
+	}
+	if kubeConfig.UserAgent == "" {
+		kubeConfig.UserAgent = rest.DefaultKubernetesUserAgent()
+	}
+
+	// HTTP client side cluster validation, shared by the Kubernetes API client and the pod HTTP client.
+	reporter := func(msg string, method string) {
+		level.Warn(logger).Log("msg", msg, "method", method, "cluster_validation_label", cfg.kubeNamespace)
+		metrics.ClientInvalidClusterValidationLabelRequests.WithLabelValues(method, "http", cfg.kubeNamespace).Inc()
+	}
+
+	// Client for the HTTP endpoints the operator calls directly on pods (e.g. prepare-downscale). It uses a
+	// transport separate from the Kubernetes API client, so these calls are never subject to the
+	// per-API-group rate limiter and are tracked under their own metric. Its timeout is configured via
+	// -pods.client-timeout (default 5s, matching the value previously hardcoded in the prepare-downscale webhook).
+	podHTTPClient := instrumentation.NewPodHTTPClient(nil, cfg.kubeNamespace, reporter, cfg.podClientTimeout, reg)
+
+	// The instrumentation histogram and rate limiter metrics are shared across every dedicated Kubernetes
+	// client built below (core controller, pod-eviction, no-downscale, prepare-downscale), each labelled
+	// with its own component name. Each of those clients otherwise gets a fully independent config (via
+	// wireComponentConfig below): independent per-API-group rate limiter buckets, so a flood of requests
+	// from one cannot starve another, and independent instrumentation, so their throughput and rejections
+	// are distinguishable in the shared metrics rather than being indistinguishably summed together.
+	apiClientHist := instrumentation.NewKubernetesAPIClientRequestDurationHistogram(reg)
+	apiClientRateLimitMetrics := instrumentation.NewKubernetesAPIClientRateLimitMetrics(reg)
+
+	// wireComponentConfig returns an independent copy of the base Kubernetes client config, instrumented,
+	// rate-limited and cluster-validated under the given component name. See LimitKubernetesAPIClientPerAPIGroup
+	// for why rate limiting is done at the transport level rather than via the rest.Config QPS/Burst fields.
+	// Rate limiting is applied after instrumentation so the instrumentation transport (which measures API
+	// latency) sits inside it and does not count the time spent waiting for a rate limiter token.
+	wireComponentConfig := func(component string) *rest.Config {
+		c := rest.CopyConfig(kubeConfig)
+		instrumentation.InstrumentKubernetesAPIClient(c, apiClientHist, component)
+		instrumentation.LimitKubernetesAPIClientPerAPIGroup(c, float32(cfg.kubeClientQPS), cfg.kubeClientBurst, apiClientRateLimitMetrics, component)
+		c.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return middleware.ClusterValidationRoundTripper(cfg.kubeNamespace, reporter, rt)
+		})
+		return c
+	}
+
+	coreConfig := wireComponentConfig("core-controller")
+
+	// share the transport between all clients which are part of the core controller
+	httpClient, err := rest.HTTPClientFor(coreConfig)
+	if err != nil {
+		fatal(fmt.Errorf("failed to create Kubernetes HTTP client: %w", err))
+	}
+
+	coreKubeClient, err := kubernetes.NewForConfigAndClient(coreConfig, httpClient)
+	if err != nil {
+		fatal(fmt.Errorf("failed to create Kubernetes client: %w", err))
+	}
+
+	restMapper, err := apiutil.NewDynamicRESTMapper(coreConfig, httpClient)
+	if err != nil {
+		fatal(fmt.Errorf("failed to create REST Mapper: %w", err))
+	}
+
+	// we don't use cached discovery because DiscoveryScaleKindResolver does its own caching,
+	// so we want to re-fetch every time when we actually ask for it
+	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(coreKubeClient.Discovery())
+	scaleClient, err := scale.NewForConfig(coreConfig, restMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+	if err != nil {
+		fatal(fmt.Errorf("failed to init scaleClient: %w", err))
+	}
+
+	dynamicClient, err := dynamic.NewForConfigAndClient(coreConfig, httpClient)
+	if err != nil {
+		fatal(fmt.Errorf("failed to init dynamicClient: %w", err))
+	}
+
+	var identity string
+	if cfg.leaderElectionEnabled {
+		hostname, err := os.Hostname()
+		if err != nil {
+			fatal(fmt.Errorf("failed to determine leader election identity: %w", err))
+		}
+		if cfg.kubePodName == "" {
+			cfg.kubePodName = hostname
+		}
+		identity = fmt.Sprintf("%s_%s", cfg.kubePodName, uuid.NewString())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		waitForSignalOrRestart(logger, restart)
+		cancel()
+	}()
+
+	err = runWithLeaderElection(ctx, coreKubeClient, cfg, identity, logger, ready, func(leaderCtx context.Context) {
+		runOperator(leaderCtx, cfg, wireComponentConfig, podHTTPClient, logger, coreKubeClient, dynamicClient, restMapper, scaleClient, restart, reg, metrics, zpdbMetrics, ready, statusReader)
+	})
+	if err != nil {
+		fatal(err)
+	}
+}
+
+func runOperator(
+	ctx context.Context,
+	cfg config,
+	wireComponentConfig func(string) *rest.Config,
+	podHTTPClient *instrumentation.PodHTTPClient,
+	logger log.Logger,
+	coreKubeClient *kubernetes.Clientset,
+	dynamicClient dynamic.Interface,
+	restMapper meta.RESTMapper,
+	scaleClient scale.ScalesGetter,
+	restart chan string,
+	reg *prometheus.Registry,
+	metrics *metrics,
+	zpdbMetrics *zpdb.Metrics,
+	ready *atomic.Bool,
+	statusReader *status.Holder,
+) {
+	// watches for validating webhooks being added - this is only started if the TLS server is started
+	webhookObserver := tlscert.NewWebhookObserver(coreKubeClient, cfg.kubeNamespace, logger)
+	defer stopOnCancel(ctx, webhookObserver.Stop)()
+
+	// The single pod informer for the namespace, shared by the eviction controller and the core controller.
+	podsFactory := controller.NewPodInformerFactory(coreKubeClient, cfg.kubeNamespace)
+
+	// Controller for pod eviction.
+	// If the TLS server is started below (webhooks registered), then this controller will handle the validating webhook requests
+	// for pod evictions and zpdb configuration changes. If the webhooks are not enabled, this controller is still started
+	// and will be used by the main controller to assist in validating pod deletion requests.
+	//
+	// The eviction controller gets a dedicated Kubernetes client so that a flood of pod eviction requests
+	// (its hot path: pod and StatefulSet get/list) is rate limited independently and cannot starve the core
+	// controller or the other webhooks. The dynamic client (used only to watch ZPDB config, a cold path) stays shared.
+	evictionKubeClient, err := newDedicatedKubeClient(wireComponentConfig("pod-eviction"))
+	if err != nil {
+		fatal(fmt.Errorf("failed to create pod eviction Kubernetes client: %w", err))
+	}
+	evictionController := zpdb.NewEvictionController(evictionKubeClient, dynamicClient, cfg.kubeNamespace, podsFactory, logger, zpdbMetrics)
+	if cfg.allowMissingCRDs {
+		evictionController.AllowMissingCRDs()
+	}
+	defer stopOnCancel(ctx, evictionController.Stop)()
+	if err := evictionController.Start(); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		fatal(err)
+	}
+
+	if err := maybeStartTLSServer(ctx, cfg, wireComponentConfig, podHTTPClient, logger, coreKubeClient, restart, metrics, evictionController, webhookObserver); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		fatal(err)
+	}
+
+	// Monitors the validating and mutating webhook configurations and provides a metric
+	// which tracks the configured FailurePolicy
+	var webhookCollector *webhooks.WebhookCollector
+	if cfg.serverTLSEnabled {
+		webhookCollector = webhooks.NewWebhookCollector(coreKubeClient, cfg.kubeNamespace, logger)
+		defer stopOnCancel(ctx, webhookCollector.Stop)()
+		if err := webhookCollector.Start(); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			fatal(fmt.Errorf("failed to start webhook collector: %w", err))
+		}
+		check(reg.Register(webhookCollector))
+		defer reg.Unregister(webhookCollector)
+	}
+
+	// Init the controller
+	c := controller.NewRolloutController(coreKubeClient, coreKubeClient.Discovery(), restMapper, scaleClient, dynamicClient, cfg.kubeClusterDomain, cfg.kubeNamespace, podsFactory, podHTTPClient, cfg.reconcileInterval, reg, logger, evictionController)
+	if cfg.allowMissingCRDs {
+		c.AllowMissingCRDs()
+	}
+	if cfg.watchReplicaTemplates {
+		c.WatchReplicaTemplates()
+	}
+	defer stopOnCancel(ctx, c.Stop)()
+	if err := c.Init(); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		fatal(fmt.Errorf("failed to init controller: %w", err))
+	}
+	statusReader.Set(c)
+
+	defer stopOnCancel(ctx, func() {
+		ready.Store(false)
+		statusReader.Set(nil)
+	})()
+
+	// Publish the leader only after its admission caches and TLS listener are initialized.
+	if err := setLeaderLabel(ctx, coreKubeClient, cfg, true); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		fatal(fmt.Errorf("failed to publish leader pod: %w", err))
+	}
+	ready.Store(true)
+
+	// Run and block until stopped.
+	c.Run()
+	if ctx.Err() == nil {
+		fatal(errors.New("rollout controller stopped unexpectedly"))
+	}
+}
+
+// Register shutdown before initialization so cancellation interrupts informer cache sync.
+func stopOnCancel(ctx context.Context, stop func()) func() {
+	done := make(chan struct{})
+	cancel := context.AfterFunc(ctx, func() {
+		stop()
+		close(done)
+	})
+	return func() {
+		if cancel() {
+			stop()
+		} else {
+			<-done
+		}
+	}
+}
+
+func runWithLeaderElection(
+	ctx context.Context,
+	client kubernetes.Interface,
+	cfg config,
+	identity string,
+	logger log.Logger,
+	ready *atomic.Bool,
+	run func(context.Context),
+) error {
+	if !cfg.leaderElectionEnabled {
+		run(ctx)
+		return nil
+	}
+
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      cfg.leaderElectionLeaseName,
+			Namespace: cfg.kubeNamespace,
+		},
+		Client: client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: identity,
+		},
+	}
+
+	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+		Lock:          lock,
+		LeaseDuration: cfg.leaderElectionLeaseDuration,
+		RenewDeadline: cfg.leaderElectionRenewDeadline,
+		RetryPeriod:   cfg.leaderElectionRetryPeriod,
+		// OnStartedLeading runs asynchronously, so waiting for expiration prevents a replacement
+		// from taking over before all leader-only controllers and webhooks have stopped.
+		ReleaseOnCancel: false,
+		Name:            "rollout-operator",
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(leaderCtx context.Context) {
+				ready.Store(false)
+				level.Info(logger).Log("msg", "acquired leader election lease", "lease", cfg.leaderElectionLeaseName, "identity", identity)
+				run(leaderCtx)
+			},
+			OnStoppedLeading: func() {
+				// Leadership loss makes this process unavailable until it exits.
+				ready.Store(false)
+			},
+			OnNewLeader: func(newIdentity string) {
+				if newIdentity != identity {
+					level.Info(logger).Log("msg", "new leader elected", "lease", cfg.leaderElectionLeaseName, "identity", newIdentity)
+				}
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to configure leader election: %w", err)
+	}
+
+	// A restarted pod must not retain the routing label from its previous process.
+	if err := setLeaderLabel(ctx, client, cfg, false); err != nil {
+		return fmt.Errorf("failed to clear leader pod label: %w", err)
+	}
+	defer func() {
+		ready.Store(false)
+		// Do not delay process exit with API requests after a lost Lease.
+		if ctx.Err() == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := setLeaderLabel(cleanupCtx, client, cfg, false); err != nil {
+			level.Warn(logger).Log("msg", "failed to clear leader pod label", "err", err)
+		}
+	}()
+
+	// Standbys are available to their Deployment while the Service selects only the leader.
+	ready.Store(true)
+	elector.Run(ctx)
+	ready.Store(false)
+	if ctx.Err() != nil {
+		return nil
+	}
+	return errors.New("leader election lease lost")
+}
+
+func waitForSignalOrRestart(logger log.Logger, restart chan string) {
+	sigint := make(chan os.Signal, 1)
+	signal.Notify(sigint, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case sig := <-sigint:
+		level.Info(logger).Log("msg", "received signal", "signal", sig)
+	case reason := <-restart:
+		level.Info(logger).Log("msg", "restarting", "reason", reason)
+	}
+}
+
+func maybeStartTLSServer(ctx context.Context, cfg config, wireComponentConfig func(component string) *rest.Config, podHTTPClient *instrumentation.PodHTTPClient, logger log.Logger, coreKubeClient *kubernetes.Clientset, restart chan string, metrics *metrics, evictionController *zpdb.EvictionController, webhookObserver *tlscert.WebhookObserver) error {
+	if !cfg.serverTLSEnabled {
+		level.Info(logger).Log("msg", "tls server is not enabled")
+		return nil
+	}
+
+	var certProvider tlscert.Provider
+	var err error
+	if cfg.serverSelfSignedCert {
+		if cfg.serverSelfSignedCertDNSName == "" {
+			cfg.serverSelfSignedCertDNSName = fmt.Sprintf("rollout-operator.%s.svc", cfg.kubeNamespace)
+		}
+		selfSignedProvider := tlscert.NewSelfSignedCertProvider("rollout-operator", []string{cfg.serverSelfSignedCertDNSName}, []string{cfg.serverSelfSignedCertOrg}, time.Duration(cfg.serverSelfSignedCertExpiration))
+		certProvider = tlscert.NewKubeSecretPersistedCertProvider(selfSignedProvider, logger, coreKubeClient, cfg.kubeNamespace, cfg.serverSelfSignedCertSecretName)
+	} else if cfg.serverCertFile != "" && cfg.serverKeyFile != "" {
+		certProvider, err = tlscert.NewFileCertProvider(cfg.serverCertFile, cfg.serverKeyFile)
+		if err != nil {
+			fatal(fmt.Errorf("failed to create file cert provider: %w", err))
+		}
+	} else {
+		fatal(errors.New("either self-signed certificate should be enabled or path to the certificate and key should be provided"))
+	}
+
+	cert, err := certProvider.Certificate(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get certificate: %w", err)
+	}
+
+	checkAndWatchCertificate(cert, logger, restart)
+
+	if cfg.updateWebhooksWithSelfSignedCABundle {
+		if !cfg.serverSelfSignedCert {
+			fatal(errors.New("self-signed certificate should be enabled to update the CA bundle in the webhook configurations"))
+		}
+
+		webHookListener := &tlscert.WebhookConfigurationListener{
+			OnValidatingWebhookConfiguration: func(webhook *admissionregistrationv1.ValidatingWebhookConfiguration) error {
+				return tlscert.PatchCABundleOnValidatingWebhook(logger, coreKubeClient, cfg.kubeNamespace, cert.CA, webhook)
+			},
+			OnMutatingWebhookConfiguration: func(webhook *admissionregistrationv1.MutatingWebhookConfiguration) error {
+				return tlscert.PatchCABundleOnMutatingWebhook(logger, coreKubeClient, cfg.kubeNamespace, cert.CA, webhook)
+			},
+		}
+
+		// Start monitoring for validating webhook configurations and patch if required
+		if err := webhookObserver.Init(webHookListener); err != nil {
+			return err
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	prepDownscaleAdmitFunc := func(ctx context.Context, logger log.Logger, ar v1.AdmissionReview, api *kubernetes.Clientset) *v1.AdmissionResponse {
+		return admission.PrepareDownscale(ctx, podHTTPClient, logger, ar, api, cfg.useZoneTracker, cfg.zoneTrackerConfigMapName, cfg.kubeClusterDomain)
+	}
+
+	podEvictionFunc := func(ctx context.Context, _ log.Logger, ar v1.AdmissionReview, _ *kubernetes.Clientset) *v1.AdmissionResponse {
+		return evictionController.HandlePodEvictionRequest(ctx, ar, zpdb.NewMaxUnavailableZeroOverrideNone())
+	}
+
+	zpdbValidationFunc := func(ctx context.Context, l log.Logger, ar v1.AdmissionReview, _ *kubernetes.Clientset) *v1.AdmissionResponse {
+		return admission.ZoneAwarePdbValidatingWebhookHandler(ctx, l, ar)
+	}
+
+	tlsSrv, err := newTLSServer(cfg, logger, cert, metrics)
+	if err != nil {
+		fatal(fmt.Errorf("failed to create tls server: %w", err))
+	}
+
+	// Each webhook that issues Kubernetes API calls gets its own dedicated client, so that an overloaded
+	// webhook is rate limited independently (its own per-API-group buckets) and cannot throttle the other
+	// webhooks or the core controller. The pod-eviction webhook uses the eviction controller's dedicated
+	// client; the zpdb-validation webhook makes no API calls, so it is served with a nil client.
+	noDownscaleKubeClient, err := newDedicatedKubeClient(wireComponentConfig("no-downscale"))
+	if err != nil {
+		fatal(fmt.Errorf("failed to create no-downscale webhook Kubernetes client: %w", err))
+	}
+	prepareDownscaleKubeClient, err := newDedicatedKubeClient(wireComponentConfig("prepare-downscale"))
+	if err != nil {
+		fatal(fmt.Errorf("failed to create prepare-downscale webhook Kubernetes client: %w", err))
+	}
+
+	// Deadline imposed on each webhook handler's context. It must be shorter than the TLS server write
+	// timeout and the apiserver's webhook timeout so we respond before either gives up; it also bounds the
+	// client-side rate limiter's wait so a burst of concurrent webhook requests can't stall it (see
+	// instrumentation.LimitKubernetesAPIClientPerAPIGroup). We use 90% of the configured request timeout.
+	webhookHandlerTimeout := cfg.serverTLSRequestTimeout * 9 / 10
+	metrics.AdmissionWebhookHandlerTimeout.Set(webhookHandlerTimeout.Seconds())
+
+	tlsSrv.Handle(admission.NoDownscaleWebhookPath, admission.Serve(admission.NoDownscale, logger, noDownscaleKubeClient, webhookHandlerTimeout))
+	tlsSrv.Handle(admission.PrepareDownscaleWebhookPath, admission.Serve(prepDownscaleAdmitFunc, logger, prepareDownscaleKubeClient, webhookHandlerTimeout))
+	tlsSrv.Handle(zpdb.PodEvictionWebhookPath, admission.Serve(podEvictionFunc, logger, nil, webhookHandlerTimeout))
+	tlsSrv.Handle(admission.ZpdbValidatorWebhookPath, admission.Serve(zpdbValidationFunc, logger, nil, webhookHandlerTimeout))
+	if err := tlsSrv.Start(); err != nil {
+		fatal(fmt.Errorf("failed to start tls server: %w", err))
+	}
+	return nil
+}
+
+func checkAndWatchCertificate(cert tlscert.Certificate, logger log.Logger, restart chan string) {
+	pair, err := tls.X509KeyPair(cert.Cert, cert.Key)
+	if err != nil {
+		fatal(fmt.Errorf("failed to parse the provided certificate: %w", err))
+	}
+
+	for i, bytes := range pair.Certificate {
+		c, err := x509.ParseCertificate(bytes)
+		if err != nil {
+			fatal(fmt.Errorf("failed to parse the provided certificate %d: %s", i, err))
+		}
+
+		expiresIn := time.Until(c.NotAfter)
+		if expiresIn <= 0 {
+			fatal(fmt.Errorf("the provided certificate %d for %s issued by %s is expired: notAfter=%s", i, c.Subject, c.Issuer, c.NotAfter))
+		}
+
+		level.Info(logger).Log("msg", "setting restart timer for CA certificate expiration", "expires_in", expiresIn, "expires_at", c.NotAfter, "subject", c.Subject, "issuer", c.Issuer)
+		time.AfterFunc(expiresIn, func() {
+			restart <- fmt.Sprintf("certificate for %s issued by %s expired", c.Subject, c.Issuer)
+		})
+	}
+
+}
+
+// newDedicatedKubeClient builds a *kubernetes.Clientset backed by its own HTTP transport. The per-API-group
+// client-side rate limiter lives in the transport (see instrumentation.LimitKubernetesAPIClientPerAPIGroup),
+// so each client returned here has an independent set of rate limiter buckets. This isolates components from
+// each other: an overloaded webhook exhausts only its own buckets and cannot throttle the other webhooks or
+// the core controller. The underlying TCP connection pool is still shared (client-go caches it by TLS config),
+// so the isolation is cheap.
+func newDedicatedKubeClient(cfg *rest.Config) (*kubernetes.Clientset, error) {
+	httpClient, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfigAndClient(cfg, httpClient)
+}
+
+func buildKubeConfig(apiURL, cfgFile string) (*rest.Config, error) {
+	if cfgFile != "" {
+		config, err := clientcmd.BuildConfigFromFlags(apiURL, cfgFile)
+		if err != nil {
+			return nil, err
+		}
+		return config, nil
+	}
+
+	return rest.InClusterConfig()
+}
+
+func initLogger(logFormat, minLevel string) (log.Logger, error) {
+	var logger log.Logger
+	switch logFormat {
+	case "logfmt":
+		logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+	case "json":
+		logger = log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+	default:
+		return nil, fmt.Errorf("unknown log format: %s", logFormat)
+	}
+
+	var options []level.Option
+
+	switch minLevel {
+	case "debug":
+		options = append(options, level.AllowDebug())
+	case "info":
+		options = append(options, level.AllowInfo())
+	case "warn":
+		options = append(options, level.AllowWarn())
+	case "error":
+		options = append(options, level.AllowError())
+	default:
+		return nil, fmt.Errorf("unknown log level: %s", minLevel)
+	}
+
+	logger = level.NewFilter(logger, options...)
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+
+	return logger, nil
+}
+
+func readyHandler(ready *atomic.Bool) http.Handler {
+	return http.HandlerFunc(func(res http.ResponseWriter, _ *http.Request) {
+		if ready.Load() {
+			res.WriteHeader(http.StatusOK)
+		} else {
+			res.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+}
+
+func check(err error) {
+	if err != nil {
+		fatal(err)
+	}
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+	os.Exit(1)
+}

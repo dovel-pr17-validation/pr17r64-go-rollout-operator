@@ -1,0 +1,984 @@
+package zpdb
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/go-logfmt/logfmt"
+	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+	admissionv1 "k8s.io/api/admission/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+
+	rolloutconfig "github.com/grafana/rollout-operator/pkg/config"
+)
+
+// newTestPodsFactory builds the shared pod informer factory the eviction controller attaches to. In
+// production this is created once by controller.NewPodInformerFactory and passed to both controllers.
+func newTestPodsFactory(kubeClient kubernetes.Interface) informers.SharedInformerFactory {
+	return informers.NewSharedInformerFactoryWithOptions(kubeClient, informerSyncInterval, informers.WithNamespace(testNamespace))
+}
+
+const (
+	statefulSetZoneA  = "ingester-zone-a"
+	statefulSetZoneB  = "ingester-zone-b"
+	statefulSetZoneC  = "ingester-zone-c"
+	testPodZoneA0     = "ingester-zone-a-0"
+	testPodZoneA1     = "ingester-zone-a-1"
+	testPodZoneA2     = "ingester-zone-a-2"
+	testPodZoneB0     = "ingester-zone-b-0"
+	testPodZoneB1     = "ingester-zone-b-1"
+	testPodZoneB2     = "ingester-zone-b-2"
+	testPodZoneC0     = "ingester-zone-c-0"
+	testPodZoneC1     = "ingester-zone-c-1"
+	testPodZoneC2     = "ingester-zone-c-2"
+	rolloutGroupValue = "ingester"
+	nameLabel         = "name"
+)
+
+type testContext struct {
+	ctx        context.Context
+	logs       *dummyLogger
+	request    admissionv1.AdmissionReview
+	controller *EvictionController
+	kubeClient *fake.Clientset
+}
+
+// A dummyLogger accumulates log lines into a slice so we can assert that certain logs were recorded
+type dummyLogger struct {
+	logs []string
+}
+
+func newDummyLogger() *dummyLogger {
+	return &dummyLogger{
+		logs: make([]string, 0),
+	}
+}
+
+func (d *dummyLogger) Log(keyVals ...interface{}) error {
+	var buf bytes.Buffer
+	enc := logfmt.NewEncoder(&buf)
+
+	for i := 0; i < len(keyVals); i += 2 {
+		_ = enc.EncodeKeyval(keyVals[i], keyVals[i+1])
+	}
+	_ = enc.EndRecord()
+
+	d.logs = append(d.logs, buf.String())
+	return nil
+}
+
+// assertHasLog ensures there is a log line which contains all the given elements
+// Note that we do not care about the ordering of the elements
+func (d *dummyLogger) assertHasLog(t *testing.T, elements []string) {
+
+	for _, line := range d.logs {
+		found := true
+		for _, element := range elements {
+			if !strings.Contains(line, element) {
+				found = false
+				break
+			}
+		}
+		if found {
+			return
+		}
+	}
+
+	require.Fail(t, "Expected log not found", strings.Join(elements, ", "))
+}
+
+func newTestContext(t *testing.T, request admissionv1.AdmissionReview, pdbRawConfig *unstructured.Unstructured, objects ...runtime.Object) *testContext {
+	testCtx := &testContext{
+		ctx:     context.Background(),
+		logs:    newDummyLogger(),
+		request: request,
+	}
+
+	zpdbMetrics := NewMetrics(prometheus.NewRegistry())
+
+	testCtx.kubeClient = fake.NewClientset(objects...)
+	testCtx.controller = NewEvictionController(testCtx.kubeClient, newFakeDynamicClient(), testNamespace, newTestPodsFactory(testCtx.kubeClient), testCtx.logs, zpdbMetrics)
+	require.NoError(t, testCtx.controller.Start())
+
+	if pdbRawConfig != nil {
+		_, _, _ = testCtx.controller.cfgObserver.pdbCache.addOrUpdateRaw(pdbRawConfig)
+	}
+	return testCtx
+}
+
+func newTestContextWithoutAdmissionReview(t *testing.T, pdbRawConfig *unstructured.Unstructured, objects ...runtime.Object) *testContext {
+	testCtx := &testContext{
+		ctx:  context.Background(),
+		logs: newDummyLogger(),
+	}
+
+	zpdbMetrics := NewMetrics(prometheus.NewRegistry())
+
+	kubeClient := fake.NewClientset(objects...)
+	testCtx.controller = NewEvictionController(kubeClient, newFakeDynamicClient(), testNamespace, newTestPodsFactory(kubeClient), testCtx.logs, zpdbMetrics)
+	require.NoError(t, testCtx.controller.Start())
+
+	if pdbRawConfig != nil {
+		_, _, _ = testCtx.controller.cfgObserver.pdbCache.addOrUpdateRaw(pdbRawConfig)
+	}
+	return testCtx
+}
+
+func (c *testContext) assertDenyResponse(t *testing.T, reason string, statusCode int) {
+	response := c.controller.HandlePodEvictionRequest(c.ctx, c.request, NewMaxUnavailableZeroOverrideNone())
+	require.NotNil(t, response.UID)
+	require.False(t, response.Allowed)
+	require.Equal(t, reason, response.Result.Message)
+	require.Equal(t, int32(statusCode), response.Result.Code)
+}
+
+func (c *testContext) assertDenyResponseViaMarkPodAsDeleted(t *testing.T, pod string, reason string) {
+	response := c.controller.MarkPodAsDeleted(c.ctx, testNamespace, pod, "eviction-controller-test", NewMaxUnavailableZeroOverrideNone())
+	require.ErrorContains(t, response, reason)
+}
+
+func (c *testContext) assertAllowResponseViaMarkPodAsDeleted(t *testing.T, pod string) {
+	response := c.controller.MarkPodAsDeleted(t.Context(), testNamespace, pod, "eviction-controller-test", NewMaxUnavailableZeroOverrideNone())
+	require.NoError(t, response)
+}
+
+func (c *testContext) assertAllowResponse(t *testing.T) {
+	response := c.controller.HandlePodEvictionRequest(c.ctx, c.request, NewMaxUnavailableZeroOverrideNone())
+	require.NotNil(t, response.UID)
+	require.True(t, response.Allowed)
+}
+
+func (c *testContext) assertAllowResponseWithWarning(t *testing.T, warning string) {
+	response := c.controller.HandlePodEvictionRequest(c.ctx, c.request, NewMaxUnavailableZeroOverrideNone())
+	require.NotNil(t, response.UID)
+	require.True(t, response.Allowed)
+	require.Equal(t, warning, response.Warnings[0])
+}
+
+func TestPodEviction_NotCreateEvent(t *testing.T) {
+	ar := createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace)
+	ar.Request.Operation = admissionv1.Delete
+	testCtx := newTestContext(t, ar, nil)
+	defer testCtx.controller.Stop()
+	require.Equal(t, float64(0), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("invalid-request", "400")))
+
+	testCtx.assertDenyResponse(t, "request operation is not create, got: DELETE", 400)
+
+	expectedLogEntry := []string{
+		"method=admission.PodEviction()",
+		"object.name=" + testPodZoneA0,
+		"object.namespace=" + testNamespace,
+		"object.resource=evictions",
+		"request.uid=test-request-uid",
+		`msg="pod eviction denied"`,
+		`reason="not a valid create pod eviction request"`,
+	}
+	testCtx.logs.assertHasLog(t, expectedLogEntry)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("invalid-request", "400")))
+}
+
+func TestPodEviction_NotEvictionSubResource(t *testing.T) {
+	ar := createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace)
+	ar.Request.SubResource = "foo"
+	testCtx := newTestContext(t, ar, nil)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "request SubResource is not eviction, got: foo", 400)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("invalid-request", "400")))
+}
+
+func TestPodEviction_EmptyName(t *testing.T) {
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview("", testNamespace), nil)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "request did not include both a namespace and a name", 400)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("invalid-request", "400")))
+}
+
+func TestPodEviction_PodNotFound(t *testing.T) {
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), nil)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, `pods "ingester-zone-a-0" not found`, 400)
+	testCtx.logs.assertHasLog(t, []string{`reason="unable to find pod by name"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("pod-not-found", "400")))
+}
+
+func TestPodEviction_PodNotReady(t *testing.T) {
+	// A pdb config is given so this pod is in zpdb scope: the behaviour under test is bypassing PDB
+	// enforcement for a terminal pod, which only has anything to bypass when the pod is governed by a zpdb in
+	// the first place. An out-of-scope pod is allowed regardless of readiness, so it wouldn't exercise this.
+	pod := newPodNoOwner(testPodZoneA0)
+	pod.Status.Phase = corev1.PodFailed
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), pod)
+	defer testCtx.controller.Stop()
+	testCtx.assertAllowResponseWithWarning(t, "pod is not ready")
+	testCtx.logs.assertHasLog(t, []string{`reason="pod is not ready"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("pod-not-ready", "200")))
+}
+
+func TestPodEviction_PodWithNoOwner(t *testing.T) {
+	pod := newPodNoOwner(testPodZoneA0)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), pod)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "unable to find a StatefulSet pod owner", 500)
+	testCtx.logs.assertHasLog(t, []string{`reason="unable to find pod owner"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("sts-no-found", "500")))
+}
+
+func TestPodEviction_PodNotInScope(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), nil, pod, sts)
+	defer testCtx.controller.Stop()
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("pod-not-in-scope", "200")))
+}
+
+// TestPodEviction_PodNotInScope_SkipsLiveAPICall pins the point of checking scope from the pod informer
+// cache first: for a pod which isn't covered by any zpdb, the eviction is allowed without ever calling the
+// Kubernetes API, since scope is decided from labels alone and the cache already has them.
+func TestPodEviction_PodNotInScope_SkipsLiveAPICall(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), nil, pod, sts)
+	defer testCtx.controller.Stop()
+
+	// Discard the informer's own initial list/watch so only the eviction request's own calls are recorded.
+	testCtx.kubeClient.ClearActions()
+
+	testCtx.assertAllowResponse(t)
+
+	for _, action := range testCtx.kubeClient.Actions() {
+		require.False(t, action.Matches("get", "pods"), "an out-of-scope pod must be resolved from the informer cache, not the Kubernetes API")
+	}
+}
+
+func TestPodEviction_MaxUnavailableEq0(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(0, rolloutGroupValue), pod, sts)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "max unavailable = 0", 403)
+	testCtx.logs.assertHasLog(t, []string{`reason="max unavailable = 0"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("max-unavailable-0", "403")))
+
+	// this is not a partition aware pdb
+	hasPartitionAwarePdb, err := testCtx.controller.HasPartitionAwarePdb(pod)
+	require.NoError(t, err)
+	require.False(t, hasPartitionAwarePdb)
+
+	// confirm that this check returns false for a pod not managed by this pdb
+	hasPartitionAwarePdb, err = testCtx.controller.HasPartitionAwarePdb(newPodNoOwner("foo"))
+	require.NoError(t, err)
+	require.False(t, hasPartitionAwarePdb)
+}
+
+func TestPodEviction_MaxUnavailableEq0_ViaMarkPodAsDeleted(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	testCtx := newTestContextWithoutAdmissionReview(t, newPDBMaxUnavailable(0, rolloutGroupValue), pod, sts)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponseViaMarkPodAsDeleted(t, testPodZoneA0, "max unavailable = 0")
+	testCtx.logs.assertHasLog(t, []string{`reason="max unavailable = 0"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("max-unavailable-0", "403")))
+}
+
+func TestPodEviction_MaxUnavailableEq0_Override_MarkPodAsDeleted(t *testing.T) {
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	zoneAPod0 := objs[3].(*corev1.Pod)
+
+	testCtx := newTestContextWithoutAdmissionReview(t, newPDBMaxUnavailable(0, rolloutGroupValue), objs...)
+	defer testCtx.controller.Stop()
+	// even though the config has a maxUnavailable=0, an override is passed in which allows this eviction to be considered
+	err := testCtx.controller.MarkPodAsDeleted(testCtx.ctx, testNamespace, zoneAPod0.Name, "eviction-controller-test", NewMaxUnavailableZeroOverride(1))
+	require.NoError(t, err)
+	require.True(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+}
+
+// TestPodEviction_PartitionAwareDownscale validates a downscale scenario.
+// A StatefulSet has been updated from 3 to 2 replicas.
+// The zone-a StatefulSet and pods will be updated first, and the pods prepared for downscale and shutdown.
+// There can be multiple minutes window of time from when the zone-a pods have been shutdown and the zone b StatefulSet downscale occurs.
+// During this time a voluntary eviction may arise for a zone-b pod, and the matching zone-a pod has already been shutdown and deleted.
+// We need to deny this eviction.
+func TestPodEviction_PartitionAwareDownscale(t *testing.T) {
+	objs := make([]runtime.Object, 0, 7)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+
+	stsZoneA := objs[0].(*appsv1.StatefulSet)
+	stsZoneB := objs[1].(*appsv1.StatefulSet)
+
+	// The StatefulSets have been downscaled from 3 to 2
+	replicas := int32(2)
+	// Zone A has 2 desired replicas and is running 2 replicas
+	stsZoneA.Spec.Replicas = &replicas
+	stsZoneA.Status.Replicas = replicas
+
+	zoneBReplica := int32(3)
+	// Zone B has 2 desired replicas
+	stsZoneB.Spec.Replicas = &replicas
+	// Zone B is still running 3 replicas
+	stsZoneB.Status.Replicas = zoneBReplica
+
+	// ingester-zone-a-0 --> 0
+	podPartitionZoneRegex := "[a-z\\-]+-zone-[a-z]-([0-9]+)"
+
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneB2, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "1 pod unknown in partition 2", 429)
+	testCtx.logs.assertHasLog(t, []string{`1 pod unknown in partition 2`})
+}
+
+// TestPodEviction_PartitionAwareDownscaleMaxUnavailable2 is a hypothetical case where we have 3 partition aware zones and we require a maxUnavailable=2
+// In this scenario zone A has been downscaled from 3 to 1 pods, zone B partition 2 has an unhealthy pod, and zone C is all healthy.
+// We deny the eviction of the zone c partition 2 pod.
+func TestPodEviction_PartitionAwareDownscaleMaxUnavailable2(t *testing.T) {
+	objs := make([]runtime.Object, 0, 10)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	// Zone A has scaled down to 1 pod
+	for _, p := range []string{testPodZoneA0} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	stsZoneA := objs[0].(*appsv1.StatefulSet)
+	stsZoneB := objs[1].(*appsv1.StatefulSet)
+	stsZoneC := objs[2].(*appsv1.StatefulSet)
+
+	podZoneB2 := objs[6].(*corev1.Pod)
+	podZoneB2.Status.Phase = corev1.PodFailed
+
+	// The StatefulSets have been downscaled from 3 to 2
+	replicas := int32(1)
+	// Zone A has 1 desired replicas and is running 1 replicas
+	stsZoneA.Spec.Replicas = &replicas
+	stsZoneA.Status.Replicas = replicas
+
+	zoneBCReplica := int32(3)
+	stsZoneB.Spec.Replicas = &zoneBCReplica
+	stsZoneB.Status.Replicas = zoneBCReplica
+	stsZoneC.Spec.Replicas = &zoneBCReplica
+	stsZoneC.Status.Replicas = zoneBCReplica
+
+	// ingester-zone-a-0 --> 0
+	podPartitionZoneRegex := "[a-z\\-]+-zone-[a-z]-([0-9]+)"
+
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneC2, testNamespace), newPDBMaxUnavailableWithRegex(2, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "1 pod not ready, 1 pod unknown in partition 2", 429)
+	testCtx.logs.assertHasLog(t, []string{`1 pod not ready, 1 pod unknown in partition 2`})
+}
+
+func TestPodEviction_Allowed_ViaMarkPodAsDeleted(t *testing.T) {
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	zoneAPod0 := objs[3].(*corev1.Pod)
+	zoneAPod2 := objs[5].(*corev1.Pod)
+
+	testCtx := newTestContextWithoutAdmissionReview(t, newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	defer testCtx.controller.Stop()
+	require.False(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+	// note that we do not stop the controller after this test
+	testCtx.assertAllowResponseViaMarkPodAsDeleted(t, zoneAPod0.Name)
+	require.True(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+
+	testCtx.assertDenyResponseViaMarkPodAsDeleted(t, zoneAPod2.Name, "1 pod not ready in ingester-zone-a")
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+}
+
+func TestPodEviction_MaxUnavailablePercentageEq0(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailablePercent(0, rolloutGroupValue), pod, sts)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "max unavailable = 0", 403)
+	testCtx.logs.assertHasLog(t, []string{`reason="max unavailable = 0"`})
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("max-unavailable-0", "403")))
+}
+
+// TestPodEviction_SingleZoneMultiplePodsUpscale - only 1 StatefulSet has been found
+func TestPodEviction_SingleZoneMultiplePodsUpscale(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod0 := newPod(testPodZoneA0, sts)
+	pod1 := newPod(testPodZoneA1, sts)
+
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), pod0, pod1, sts)
+	defer testCtx.controller.Stop()
+	testCtx.assertDenyResponse(t, "minimum number of StatefulSets not found", 400)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("min-sts-not-found", "400")))
+}
+
+func TestPodEviction_ReusesStatefulSetListForOwner(t *testing.T) {
+	objects := make([]runtime.Object, 0, 6)
+	for _, name := range []string{statefulSetZoneA, statefulSetZoneB, statefulSetZoneC} {
+		sts := newEvictionControllerSts(name)
+		*sts.Spec.Replicas = 1
+		sts.Status.Replicas = 1
+		objects = append(objects, sts, newPod(name+"-0", sts))
+	}
+
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objects...)
+	defer testCtx.controller.Stop()
+	testCtx.assertAllowResponse(t)
+
+	var statefulSetActions []string
+	for _, action := range testCtx.kubeClient.Actions() {
+		if action.GetResource().Resource == "statefulsets" {
+			statefulSetActions = append(statefulSetActions, action.GetVerb())
+		}
+	}
+	require.Equal(t, []string{"list"}, statefulSetActions)
+}
+
+func TestPodEviction_OwnerFallsBackToGetWhenExcludedFromList(t *testing.T) {
+	sts := newEvictionControllerSts(statefulSetZoneA)
+	pod := newPod(testPodZoneA0, sts)
+	kubeClient := fake.NewClientset(sts)
+	client := k8sClient{ctx: t.Context(), kubeClient: kubeClient}
+
+	ownerRef, err := statefulSetOwnerReference(pod)
+	require.NoError(t, err)
+	owner, err := client.owner(pod, ownerRef, &appsv1.StatefulSetList{})
+	require.NoError(t, err)
+	require.Equal(t, sts.Name, owner.Name)
+	require.Len(t, kubeClient.Actions(), 1)
+	require.True(t, kubeClient.Actions()[0].Matches("get", "statefulsets"))
+}
+
+func TestPodEviction_DeniesWhenOwnerIsExcludedFromRelatedStatefulSets(t *testing.T) {
+	owner := newEvictionControllerSts(statefulSetZoneA)
+	delete(owner.Labels, rolloutconfig.RolloutGroupLabelKey)
+	pod := newPod(testPodZoneA0, owner)
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), pod, owner, newEvictionControllerSts(statefulSetZoneB), newEvictionControllerSts(statefulSetZoneC))
+	defer testCtx.controller.Stop()
+	testCtx.kubeClient.ClearActions()
+
+	testCtx.assertDenyResponse(t, "owner StatefulSet is not in the related StatefulSets", 400)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("owner-sts-not-in-group", "400")))
+
+	var statefulSetActions []string
+	for _, action := range testCtx.kubeClient.Actions() {
+		if action.GetResource().Resource == "statefulsets" {
+			statefulSetActions = append(statefulSetActions, action.GetVerb())
+		}
+	}
+	require.Equal(t, []string{"list", "get"}, statefulSetActions)
+}
+
+func TestPodEviction_StatefulSetListFailurePreservesDecisionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		maxUnavailable int
+		reason         string
+		status         int
+	}{
+		{name: "evictions disabled", maxUnavailable: 0, reason: "max unavailable = 0", status: 403},
+		{name: "evictions enabled", maxUnavailable: 1, reason: "minimum number of StatefulSets not found", status: 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sts := newEvictionControllerSts(statefulSetZoneA)
+			pod := newPod(testPodZoneA0, sts)
+			testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(tc.maxUnavailable, rolloutGroupValue), pod, sts)
+			defer testCtx.controller.Stop()
+			testCtx.kubeClient.PrependReactor("list", "statefulsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, fmt.Errorf("list failed")
+			})
+			testCtx.kubeClient.ClearActions()
+
+			testCtx.assertDenyResponse(t, tc.reason, tc.status)
+
+			var statefulSetActions []string
+			for _, action := range testCtx.kubeClient.Actions() {
+				if action.GetResource().Resource == "statefulsets" {
+					statefulSetActions = append(statefulSetActions, action.GetVerb())
+				}
+			}
+			require.Equal(t, []string{"list", "get"}, statefulSetActions)
+		})
+	}
+}
+
+// TestPodEviction_MultiZoneClassic tests a classic multi-zone topology.
+// There are 3 StatefulSets (zone a, b, c) and each has 3 pods.
+func TestPodEviction_MultiZoneClassic(t *testing.T) {
+
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	stsZoneB := objs[1].(*appsv1.StatefulSet)
+	zoneAPod0 := objs[3].(*corev1.Pod)
+	zoneAPod2 := objs[5].(*corev1.Pod)
+	zoneCPod2 := objs[11].(*corev1.Pod)
+
+	// allow eviction since all other pods are healthy
+	// also check that the evicted pod has been stored in the eviction configCache
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	require.False(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+
+	require.True(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+	testCtx.controller.Stop()
+
+	// mark a pod in the same zone as failed - with maxUnavailable=1 this will be denied
+	zoneAPod2.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	testCtx.assertDenyResponse(t, "1 pod not ready in ingester-zone-a", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the same zone as failed - with maxUnavailable=2 this will be allowed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(2, rolloutGroupValue), objs...)
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the another zone as failed - we will deny this eviction
+	zoneCPod2.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	testCtx.assertDenyResponse(t, "1 pod not ready in ingester-zone-c", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the another zone as failed - we will deny this eviction even if max unavailable = 2
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(2, rolloutGroupValue), objs...)
+	testCtx.assertDenyResponse(t, "1 pod not ready in ingester-zone-c", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	// reset so all the pods are reporting running
+	zoneAPod2.Status.Phase = corev1.PodRunning
+	zoneCPod2.Status.Phase = corev1.PodRunning
+
+	// but zone b sts has more replicas than we will see pods for
+	stsZoneB.Status.Replicas = 4
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	testCtx.assertDenyResponse(t, "1 pod unknown in ingester-zone-b", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+}
+
+// TestPodEviction_MultiZoneClassicOverrideHasNoEffectWhenNotZero validates that the MaxUnavailableZeroOverride
+// is only used when maxUnavailable=0. Setting the override when this is not true has no effect.
+func TestPodEviction_MultiZoneClassicOverrideHasNoEffectWhenNotZero(t *testing.T) {
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	zoneAPod0 := objs[3].(*corev1.Pod)
+
+	// allow eviction since all other pods are healthy
+	// also check that the evicted pod has been stored in the eviction configCache
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailable(1, rolloutGroupValue), objs...)
+	require.False(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+
+	hasPartitionAwarePdb, err := testCtx.controller.HasPartitionAwarePdb(zoneAPod0)
+	require.NoError(t, err)
+	require.False(t, hasPartitionAwarePdb)
+
+	// note that the override of 0 is ignored since the zpdb configuration has maxUnavailable != 0
+	response := testCtx.controller.HandlePodEvictionRequest(testCtx.ctx, testCtx.request, NewMaxUnavailableZeroOverride(0))
+	require.NotNil(t, response.UID)
+	require.True(t, response.Allowed)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	require.True(t, testCtx.controller.podObserver.podEvictCache.hasPendingEviction(zoneAPod0))
+
+	// the override of 2 is ignored since the zpdb configuration has maxUnavailable != 0
+	request := createBasicEvictionAdmissionReview(testPodZoneB0, testNamespace)
+	response = testCtx.controller.HandlePodEvictionRequest(testCtx.ctx, request, NewMaxUnavailableZeroOverride(2))
+
+	require.NotNil(t, response.UID)
+	require.False(t, response.Allowed)
+	require.Equal(t, "1 pod not ready in ingester-zone-a", response.Result.Message)
+	require.Equal(t, int32(429), response.Result.Code)
+
+	testCtx.controller.Stop()
+}
+
+func TestPodEviction_PartitionZones(t *testing.T) {
+
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	stsZoneB := objs[1].(*appsv1.StatefulSet)
+	zoneAPod1 := objs[4].(*corev1.Pod)
+	zoneBPod0 := objs[6].(*corev1.Pod)
+	zoneCPod2 := objs[11].(*corev1.Pod)
+
+	// ingester-zone-a-0 --> 0
+	podPartitionZoneRegex := "[a-z\\-]+-zone-[a-z]-([0-9]+)"
+
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+
+	hasPartitionAwarePdb, err := testCtx.controller.HasPartitionAwarePdb(zoneAPod1)
+	require.NoError(t, err)
+	require.True(t, hasPartitionAwarePdb)
+
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the same zone as failed - we will allow this eviction as it's in a different partition
+	zoneAPod1.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the another zone + partition as failed - we will allow this eviction as it's in a different partition
+	zoneCPod2.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	testCtx.controller.Stop()
+
+	// mark a pod in the another zone + same partition as failed - we will deny this eviction
+	zoneBPod0.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	testCtx.assertDenyResponse(t, "1 pod not ready in partition 0", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	// reset so all the pods are reporting running
+	zoneAPod1.Status.Phase = corev1.PodRunning
+	zoneBPod0.Status.Phase = corev1.PodRunning
+	zoneCPod2.Status.Phase = corev1.PodRunning
+
+	// but zone b sts has more replicas than we will see pods for
+	stsZoneB.Status.Replicas = 4
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	testCtx.assertDenyResponse(t, "1 pod unknown in partition 0", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, "ingester(-foo)?-zone-[a-z]-([0-9]+)", int64(2)), objs...)
+	testCtx.assertDenyResponse(t, "1 pod unknown in partition 0", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+}
+
+func TestPodEviction_PartitionZonesMaxUnavailable2(t *testing.T) {
+
+	objs := make([]runtime.Object, 0, 12)
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneA))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneB))
+	objs = append(objs, newEvictionControllerSts(statefulSetZoneC))
+
+	for _, p := range []string{testPodZoneA0, testPodZoneA1, testPodZoneA2} {
+		objs = append(objs, newPod(p, objs[0].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneB0, testPodZoneB1, testPodZoneB2} {
+		objs = append(objs, newPod(p, objs[1].(*appsv1.StatefulSet)))
+	}
+	for _, p := range []string{testPodZoneC0, testPodZoneC1, testPodZoneC2} {
+		objs = append(objs, newPod(p, objs[2].(*appsv1.StatefulSet)))
+	}
+
+	zoneBPod0 := objs[6].(*corev1.Pod)
+	zoneCPod0 := objs[9].(*corev1.Pod)
+
+	// ingester-zone-a-0 --> 0
+	podPartitionZoneRegex := "[a-z\\-]+-zone-[a-z]-([0-9]+)"
+
+	// mark 1 pod in the another zone + same partition as failed
+	zoneBPod0.Status.Phase = corev1.PodFailed
+	testCtx := newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(1, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+
+	hasPartitionAwarePdb, err := testCtx.controller.HasPartitionAwarePdb(zoneBPod0)
+	require.NoError(t, err)
+	require.True(t, hasPartitionAwarePdb)
+
+	testCtx.assertDenyResponse(t, "1 pod not ready in partition 0", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(2, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+
+	hasPartitionAwarePdb, err = testCtx.controller.HasPartitionAwarePdb(zoneBPod0)
+	require.NoError(t, err)
+	require.True(t, hasPartitionAwarePdb)
+
+	testCtx.assertAllowResponse(t)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("allowed", "200")))
+	testCtx.controller.Stop()
+
+	// mark another pod in the another zone + same partition as failed
+	zoneCPod0.Status.Phase = corev1.PodFailed
+	testCtx = newTestContext(t, createBasicEvictionAdmissionReview(testPodZoneA0, testNamespace), newPDBMaxUnavailableWithRegex(2, rolloutGroupValue, podPartitionZoneRegex, int64(1)), objs...)
+	testCtx.assertDenyResponse(t, "2 pods not ready in partition 0", 429)
+	require.Equal(t, float64(1), testutil.ToFloat64(testCtx.controller.metrics.EvictionRequests.WithLabelValues("denied", "429")))
+	testCtx.controller.Stop()
+}
+
+// createBasicEvictionAdmissionReview returns a pod eviction request for the given pod name
+func createBasicEvictionAdmissionReview(podName, namespace string) admissionv1.AdmissionReview {
+	return admissionv1.AdmissionReview{
+		Request: &admissionv1.AdmissionRequest{
+			UID: "test-request-uid",
+			Kind: metav1.GroupVersionKind{
+				Group:   "policy",
+				Version: "v1",
+				Kind:    "Eviction",
+			},
+			Resource: metav1.GroupVersionResource{
+				Group:    "policy",
+				Version:  "v1",
+				Resource: "evictions",
+			},
+			Name:      podName,
+			Namespace: namespace,
+			Operation: admissionv1.Create,
+			UserInfo: authenticationv1.UserInfo{
+				Username: "test-user",
+			},
+			SubResource: "eviction",
+			Object: runtime.RawExtension{
+				Raw: []byte(fmt.Sprintf(`{
+					"apiVersion": "policy/v1",
+					"kind": "Eviction",
+					"metadata": {
+						"name": "%s",
+						"namespace": "%s"
+					}
+				}`, podName, namespace)),
+			},
+		},
+	}
+}
+
+// newPodNoOwner returns a minimal Pod structure and will not match to any StatefulSet ownership
+// The pod defaults to be in a running state
+func newPodNoOwner(name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       types.UID(uuid.New().String()),
+			Name:      name,
+			Namespace: testNamespace,
+			Labels:    map[string]string{rolloutconfig.RolloutGroupLabelKey: rolloutGroupValue},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+}
+
+// newPod returns a minimal Pod structure and will match to have the given StatefulSet as it's owner
+// The pod defaults to be in a running state, and has a rollout-group label applied
+func newPod(name string, sts *appsv1.StatefulSet) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       types.UID(uuid.New().String()),
+			Name:      name,
+			Namespace: testNamespace,
+			Labels:    map[string]string{nameLabel: sts.Name, rolloutconfig.RolloutGroupLabelKey: rolloutGroupValue},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "StatefulSet",
+					Name:       sts.Name,
+					UID:        sts.UID,
+					Controller: &[]bool{true}[0],
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+}
+
+// newEvictionControllerSts returns a minimal StatefulSet structure and has rollout-group labels set both in the meta-data and the spec selector and spec template
+func newEvictionControllerSts(name string) *appsv1.StatefulSet {
+
+	replicas := int32(3)
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+			UID:       types.UID(uuid.New().String()),
+			Labels:    map[string]string{rolloutconfig.RolloutGroupLabelKey: rolloutGroupValue},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{nameLabel: name, rolloutconfig.RolloutGroupLabelKey: rolloutGroupValue},
+			},
+			Replicas: &replicas,
+
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{nameLabel: name, rolloutconfig.RolloutGroupLabelKey: rolloutGroupValue},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: replicas,
+		},
+	}
+}
+
+// newPDBMaxUnavailable returns a raw custom resource configuration which can be used with the Config
+// This configuration has maxUnavailable=X and has a name of the given rollout-group
+func newPDBMaxUnavailable(maxUnavailable int, rolloutGroup string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": fmt.Sprintf("%s/%s", ZoneAwarePodDisruptionBudgetsSpecGroup, ZoneAwarePodDisruptionBudgetsVersion),
+			"kind":       ZoneAwarePodDisruptionBudgetName,
+			"metadata": map[string]interface{}{
+				"name":      rolloutGroup + "-rollout",
+				"namespace": testNamespace,
+			},
+			"spec": map[string]interface{}{
+				FieldMaxUnavailable: int64(maxUnavailable),
+				FieldSelector: map[string]interface{}{
+					FieldMatchLabels: map[string]interface{}{
+						rolloutconfig.RolloutGroupLabelKey: rolloutGroup,
+					},
+				},
+			},
+		},
+	}
+}
+
+// newPDBMaxUnavailablePercent returns a raw custom resource configuration which can be used with the Config
+// This configuration has maxUnavailablePercentage=X and has a name of the given rollout-group
+func newPDBMaxUnavailablePercent(maxUnavailablePercentage int, rolloutGroup string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": fmt.Sprintf("%s/%s", ZoneAwarePodDisruptionBudgetsSpecGroup, ZoneAwarePodDisruptionBudgetsVersion),
+			"kind":       ZoneAwarePodDisruptionBudgetName,
+			"metadata": map[string]interface{}{
+				"name":      rolloutGroup + "-rollout",
+				"namespace": testNamespace,
+			},
+			"spec": map[string]interface{}{
+				FieldMaxUnavailablePercentage: int64(maxUnavailablePercentage),
+				FieldSelector: map[string]interface{}{
+					FieldMatchLabels: map[string]interface{}{
+						rolloutconfig.RolloutGroupLabelKey: rolloutGroup,
+					},
+				},
+			},
+		},
+	}
+}
+
+// newPDBMaxUnavailableWithRegex returns a raw custom resource configuration which can be used with the Config
+// This configuration has maxUnavailable=X, has a name of the given rollout-group and sets the podNamePartitionRegex
+func newPDBMaxUnavailableWithRegex(maxUnavailable int, rolloutGroup string, podNamePartitionRegex string, podNameRegexGroup int64) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": fmt.Sprintf("%s/%s", ZoneAwarePodDisruptionBudgetsSpecGroup, ZoneAwarePodDisruptionBudgetsVersion),
+			"kind":       ZoneAwarePodDisruptionBudgetName,
+			"metadata": map[string]interface{}{
+				"name":      rolloutGroup + "-rollout",
+				"namespace": testNamespace,
+			},
+			"spec": map[string]interface{}{
+				FieldMaxUnavailable: int64(maxUnavailable),
+				FieldSelector: map[string]interface{}{
+					FieldMatchLabels: map[string]interface{}{
+						rolloutconfig.RolloutGroupLabelKey: rolloutGroup,
+					},
+				},
+				FieldPodNamePartitionRegex: podNamePartitionRegex,
+				FieldPodNameRegexGroup:     podNameRegexGroup,
+			},
+		},
+	}
+}

@@ -1,0 +1,577 @@
+# Changelog
+
+## main / unreleased
+
+* [ENHANCEMENT] Updated dependencies, including: #555
+  * `github.com/grafana/dskit` from `v0.0.0-20260814134254-4a836a70f745` to `v0.0.0-20261113142543-e640b7cda9b5`
+  * `github.com/prometheus/client_golang` from `v1.24.1` to `v1.25.0`
+  * `github.com/prometheus/client_model` from `v0.6.2` to `v0.6.3`
+  * `github.com/prometheus/common` from `v0.70.1` to `v0.74.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.70.0` to `v0.72.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.70.0` to `v0.72.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.45.0` to `v1.47.0`
+  * `go.opentelemetry.io/otel` from `v1.45.0` to `v1.47.0`
+  * `go.uber.org/atomic` from `v1.11.0` to `v1.12.0`
+  * `golang.org/x/mod` from `v0.41.0` to `v0.43.0`
+  * `golang.org/x/sync` from `v0.24.0` to `v0.25.0`
+  * `k8s.io/api` from `v0.36.4` to `v0.37.2`
+  * `k8s.io/apiextensions-apiserver` from `v0.36.4` to `v0.37.2`
+  * `k8s.io/apimachinery` from `v0.36.4` to `v0.37.2`
+  * `k8s.io/client-go` from `v0.36.4` to `v0.37.2`
+  * `sigs.k8s.io/controller-runtime` from `v0.24.1` to `v0.25.2`
+* [BUGFIX] Jsonnet omits the leader-election CLI flag and `POD_NAME` when election is disabled. Enable `_config.rollout_operator_leader_election_enabled` to configure election and its required permissions together. #554
+
+## v0.42.1
+
+* [BUGFIX] Allow startup when ZPDB access is forbidden with `-kubernetes.allow-missing-crds=true`. With this flag, expected `NotFound` and `Forbidden` errors from ZPDB and ReplicaTemplate informer retries are logged at info level instead of warn. #552
+
+## v0.42.0
+
+* [ENHANCEMENT] Replace the separate BoringCrypto image with native Go FIPS 140-3 support in `rollout-operator`, built with Go Cryptographic Module v1.26.0. FIPS mode is off by default; enable it with `GODEBUG=fips140=on`.
+* [ENHANCEMENT] Add opt-in `-kubernetes.allow-missing-crds=true` startup before CRDs are installed, with automatic recovery after installation. ZPDB protection is inactive while its CRD is absent; startup still waits for existing ZPDB configurations when the CRD is installed. #544
+* [BUGFIX] Count pods that a StatefulSet has not (re)created yet as not-Ready. Previously, if the replacement pods couldn't be created (for example, rejected at admission or blocked by a quota), the operator kept deleting pods beyond `rollout-max-unavailable` and could also move on to the next StatefulSet in the rollout group. #537
+* [ENHANCEMENT] Add the `grafana.com/rollout-delayed-downscale-exclude-from-status-replicas` annotation. When it is `true`, the `status.replicas` of the reference resource does not include the replicas pending delayed downscale. Without it, an HPA with `AverageValue` metrics can ignore a necessary scale up during a delayed downscale. The annotation is off by default. #545
+* [ENHANCEMENT] Add `rollout_operator_zpdb_config_observer_ready` metric and `ZpdbConfigObserverNotReady` alert, reporting whether the ZPDB config observer can access ZPDBs and has synced. The alert is disabled by default; enable it with the mixin option `rollout_operator_zpdb_config_observer_alert_enabled: true`. #530
+* [ENHANCEMENT] Add `rollout_operator_replica_template_observer_ready` metric and `ReplicaTemplateObserverNotReady` alert, reporting whether the ReplicaTemplate CRD and its scale subresource are discoverable and, with `-replica-templates.watch-enabled=true`, whether the ReplicaTemplate watch is healthy. The alert is disabled by default; enable it with the mixin option `rollout_operator_replica_template_observer_alert_enabled: true`. #531
+
+## v0.41.1
+
+* [ENHANCEMENT] Rebuild v0.41.0 with updated Go and distroless images.
+
+## v0.41.0
+
+* [ENHANCEMENT] Add ability to watch ReplicaTemplates so replica changes trigger scaling reconciliation without waiting for the informer re-sync. Enable with -replica-templates.watch-enabled=true. #503
+* [ENHANCEMENT] Reuse the related StatefulSet list to resolve a pod's owner during ZPDB eviction, avoiding a redundant Kubernetes API GET on the common path. #516
+* [BUGFIX] Preserve the readiness gate for paused StatefulSets so other zones cannot roll out while a paused zone has not-Ready pods. #515
+* [FEATURE] Add a read-only `/ui/status` HTML page for StatefulSet rollout group progress (phase, ready replicas, revisions, updated pods). #473
+* [FEATURE] Added Kubernetes Lease leader election to allow the rollout-operator to function in high availability mode. Enable with -leader-election.enabled=true. #472
+* [ENHANCEMENT] Updated dependencies to resolve CVEs. #523
+
+## v0.40.0
+
+* [CHANGE] ZPDB cross-zone eviction delays use the Pod Ready condition's `lastTransitionTime` instead of the `grafana.com/ready-time` annotation, eliminating annotation PATCH requests and measuring the delay from Kubernetes readiness transitions. The `-zpdb.pod-ready-annotation-patch-timeout` flag is deprecated, has no effect, and logs a warning when supplied. #498
+* [ENHANCEMENT] Update Go to `1.27` #494
+* [ENHANCEMENT] Updated dependencies, including: #491
+  * `github.com/stretchr/testify` from `v1.12.0` to `v1.12.1`
+  * `k8s.io/api` from `v0.36.3` to `v0.36.4`
+  * `k8s.io/apiextensions-apiserver` from `v0.36.3` to `v0.36.4`
+  * `k8s.io/apimachinery` from `v0.36.3` to `v0.36.4`
+  * `k8s.io/client-go` from `v0.36.3` to `v0.36.4`
+* [ENHANCEMENT] Updated dependencies to address CVEs, including: #501 #502
+  * `google.golang.org/grpc` from `v1.83.0` to `v1.83.2` for CVE-2026-84304, CVE-2026-84303 and CVE-2026-84445
+
+
+## v0.39.0
+
+* [CHANGE] Prefer `grafana.com/min-time-between-zones-downscale` as a StatefulSet annotation instead of a label. The label remains supported as a fallback and logs a deprecation warning when used. #463
+* [ENHANCEMENT] Use informer pod cache for eviction request ZPDB scope determination. Removes Kubernetes API call for pods not within the ZPDB. #479
+* [ENHANCEMENT] Added the `KubernetesAPIClientRateLimited` alert, firing when the rollout-operator has been unable to send Kubernetes API requests because its client-side rate limiter is exhausted, and the `KubernetesAPIClientApproachingRateLimit` alert, an earlier warning firing when a component sustains over 80% of its own configured limit for an API group. #479 #481
+* [ENHANCEMENT] Added `rollout_operator_kubernetes_api_client_rate_limit_qps`, the configured `-kubernetes.client-qps` value, published per component only while client-side rate limiting is enabled for it. #479
+* [ENHANCEMENT] Added `rollout_operator_admission_webhook_handler_timeout_seconds`, the deadline imposed on each admission webhook handler's context (90% of `-server-tls.request-timeout`), and `api_group` and `component` labels to `rollout_operator_kubernetes_api_client_request_duration_seconds` and `component` to `rollout_operator_kubernetes_api_client_rate_limited_requests_total`, identifying which of the core controller, pod-eviction, no-downscale or prepare-downscale webhook clients a request belongs to. #479
+* [ENHANCEMENT] Updated the rollout-operator dashboard mixin with a "Kubernetes API client rate limiting" row (rate limited requests, percent of requests rejected, and throughput vs. recent observed peak, all by API group and component) and a deadline threshold line on the p99 webhook latency panel. #479 #481
+* [ENHANCEMENT] The rollout controller and the ZPDB eviction controller now share a single pod informer for the namespace, replacing two independent watches and two in-memory copies of every pod. #480
+* [ENHANCEMENT] Updated dependencies, including: #470 #484
+  * `github.com/grafana/dskit` from `v0.0.0-20260703122047-de1ec7541c44` to `v0.0.0-20260814134254-4a836a70f745`
+  * `github.com/prometheus/client_golang` from `v1.23.2` to `v1.24.1`
+  * `github.com/prometheus/common` from `v0.70.0` to `v0.70.1`
+  * `github.com/stretchr/testify` from `v1.11.1` to `v1.12.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.69.0` to `v0.70.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.69.0` to `v0.70.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.44.0` to `v1.45.0`
+  * `go.opentelemetry.io/otel` from `v1.44.0` to `v1.45.0`
+  * `golang.org/x/mod` from `v0.38.0` to `v0.40.0`
+  * `k8s.io/api` from `v0.36.2` to `v0.36.3`
+  * `k8s.io/apiextensions-apiserver` from `v0.36.2` to `v0.36.3`
+  * `k8s.io/apimachinery` from `v0.36.2` to `v0.36.3`
+  * `k8s.io/client-go` from `v0.36.2` to `v0.36.3`
+* [BUGFIX] Avoid doubling a leading `/` when building prepare-downscale pod URLs from `grafana.com/prepare-downscale-http-path`. #468
+* [BUGFIX] Allow a StatefulSet rollout to recover when pods from a previous failed update are stuck in an unrecoverable state (e.g. `CrashLoopBackOff` or `ImagePullBackOff`): outdated stuck pods are deleted even when the `rollout-max-unavailable` budget is exhausted, since deleting an already-unavailable pod doesn't reduce availability. A subsequent Spec update can then replace them without a manual delete. #466
+
+## v0.38.1
+
+* [ENHANCEMENT] Updated dependencies, including: #443 #447 #455 #457
+  * `github.com/grafana/dskit` from `v0.0.0-20260601123808-0d4540e255b4` to `v0.0.0-20260703122047-de1ec7541c44`
+  * `github.com/prometheus/common` from `v0.68.0` to `v0.70.0`
+  * `golang.org/x/mod` from `v0.36.0` to `v0.38.0`
+  * `golang.org/x/sync` from `v0.20.0` to `v0.22.0`
+  * `k8s.io/api` from `v0.36.1` to `v0.36.2`
+  * `k8s.io/apiextensions-apiserver` from `v0.36.1` to `v0.36.2`
+  * `k8s.io/apimachinery` from `v0.36.1` to `v0.36.2`
+  * `k8s.io/client-go` from `v0.36.1` to `v0.36.2`
+
+## v0.38.0
+
+* [CHANGE] Client-side rate limiting to the Kubernetes API is now enforced with an independent token bucket per API group (e.g. `core/v1`, `apps/v1`, `policy/v1`), and each admission webhook gets its own dedicated client so an overloaded webhook cannot throttle the others or the core controller. As a result, the meaning of `-kubernetes.client-qps=0` changed: it previously fell back to the client-go default (~5 QPS / 10 burst per API group), but now disables client-side rate limiting entirely. The defaults of `-kubernetes.client-qps` (now `5`) and `-kubernetes.client-burst` (now `10`) preserve the previous effective throttling. #441
+* [FEATURE] Added `-server-tls.request-timeout` to configure the request timeout of the TLS server that serves the admission webhooks (used as the read and write timeouts). Defaults to `10s`, matching the previous hardcoded value. #441
+* [FEATURE] Added `-pods.client-timeout` to configure the timeout of HTTP requests issued directly to pod endpoints (e.g. prepare-downscale). Defaults to `5s`, matching the previous hardcoded value. #441
+* [BUGFIX] Admission webhook handlers now run under a context deadline (90% of `-server-tls.request-timeout`). Without it, a burst of concurrent webhook requests (e.g. pod evictions during node draining) on the deadline-less webhook request contexts drove the client-side rate limiter's token-bucket reservation timeline to run away and stall, so the rollout-operator's Kubernetes API requests collapsed to near-zero throughput and webhooks failed with `context canceled`. The deadline also cancels in-flight Kubernetes API calls when it elapses. #441
+* [ENHANCEMENT] Updated dependencies, including: #439
+  * `github.com/grafana/dskit` from `v0.0.0-20260505171221-7f6e6a43e255` to `v0.0.0-20260601123808-0d4540e255b4`
+  * `github.com/prometheus/common` from `v0.67.5` to `v0.68.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.68.0` to `v0.69.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.68.0` to `v0.69.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.43.0` to `v1.44.0`
+  * `go.opentelemetry.io/otel` from `v1.43.0` to `v1.44.0`
+  * `golang.org/x/mod` from `v0.35.0` to `v0.36.0`
+  * `k8s.io/api` from `v0.36.0` to `v0.36.1`
+  * `k8s.io/apiextensions-apiserver` from `v0.36.0` to `v0.36.1`
+  * `k8s.io/apimachinery` from `v0.36.0` to `v0.36.1`
+  * `k8s.io/client-go` from `v0.36.0` to `v0.36.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.24.0` to `v0.24.1`
+
+## v0.37.0
+
+* [ENHANCEMENT] Add support for zone-aware PDB to enforce a fixed delay between evictions within the same partition. #422
+
+## v0.36.2
+
+* [ENHANCEMENT] Updated dependencies, including: #411 #417 #420 #423 #426
+  * `github.com/grafana/dskit` from `v0.0.0-20260331143437-59c9c0f93cdd` to `v0.0.0-20260505171221-7f6e6a43e255`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.67.0` to `v0.68.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.67.0` to `v0.68.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.42.0` to `v1.43.0`
+  * `go.opentelemetry.io/otel` from `v1.42.0` to `v1.43.0`
+  * `golang.org/x/mod` from `v0.34.0` to `v0.35.0`
+  * `k8s.io/api` from `v0.35.3` to `v0.36.0`
+  * `k8s.io/apiextensions-apiserver` from `v0.35.3` to `v0.36.0`
+  * `k8s.io/apimachinery` from `v0.35.3` to `v0.36.0`
+  * `k8s.io/client-go` from `v0.35.3` to `v0.36.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.23.3` to `v0.24.0`
+
+## v0.36.1
+
+* [ENHANCEMENT] Updated dependencies, including: #408
+  * `github.com/grafana/dskit` from `v0.0.0-20260319123529-d1a3353450a7` to `v0.0.0-20260331143437-59c9c0f93cdd`
+* [BUGFIX] Fix crash when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set due to conflicting OpenTelemetry schema URL. #408
+
+## v0.36.0
+
+* [FEATURE] Add `grafana.com/rollout-paused` annotation to temporarily prevent the operator from deleting pods in a StatefulSet to roll out changes. Other StatefulSets in the same rollout group continue rolling out normally. #396
+* [ENHANCEMENT] Add `-kubernetes.client-qps` and `-kubernetes.client-burst` flags to configure Kubernetes API client rate limiting. #385
+* [ENHANCEMENT] Updated dependencies, including: #377 #388 #393 #397 #400
+  * `github.com/grafana/dskit` from `v0.0.0-20260209132809-8d1c6d34bb5a` to `v0.0.0-20260319123529-d1a3353450a7`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.65.0` to `v0.67.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.65.0` to `v0.67.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.40.0` to `v1.42.0`
+  * `go.opentelemetry.io/otel` from `v1.40.0` to `v1.42.0`
+  * `golang.org/x/mod` from `v0.32.0` to `v0.34.0`
+  * `golang.org/x/sync` from `v0.19.0` to `v0.20.0`
+  * `k8s.io/api` from `v0.35.0` to `v0.35.3`
+  * `k8s.io/apiextensions-apiserver` from `v0.35.0` to `v0.35.3`
+  * `k8s.io/apimachinery` from `v0.35.0` to `v0.35.3`
+  * `k8s.io/client-go` from `v0.35.0` to `v0.35.3`
+  * `sigs.k8s.io/controller-runtime` from `v0.23.1` to `v0.23.3`
+
+## v0.35.0
+
+* [FEATURE] Add `grafana.com/rollout-force-replicas` annotation to manually override the replica count for a StatefulSet, bypassing the operator's normal scaling logic. #371
+* [ENHANCEMENT] Updated dependencies, including: #374
+  * `github.com/grafana/dskit` from `v0.0.0-20260130162739-bd087f70604d` to `v0.0.0-20260209132809-8d1c6d34bb5a`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.64.0` to `v0.65.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.64.0` to `v0.65.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.39.0` to `v1.40.0`
+  * `go.opentelemetry.io/otel` from `v1.39.0` to `v1.40.0`
+* [ENHANCEMENT] Update Go to `1.26` #375
+* [BUGFIX] Zone-aware PDB: deny evictions when cross-zone pod peers are not found in partitioned environments. #370
+
+## v0.34.0
+
+* [ENHANCEMENT] Updated dependencies, including: #358 #363 #365 #367
+  * `github.com/grafana/dskit` from `v0.0.0-20251208160410-c006bba17343` to `v0.0.0-20260130162739-bd087f70604d`
+  * `github.com/prometheus/common` from `v0.67.4` to `v0.67.5`
+  * `github.com/sirupsen/logrus` from `v1.9.3` to `v1.9.4`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.63.0` to `v0.64.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.63.0` to `v0.64.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.38.0` to `v1.39.0`
+  * `go.opentelemetry.io/otel` from `v1.38.0` to `v1.39.0`
+  * `k8s.io/api` from `v0.34.2` to `v0.35.0`
+  * `k8s.io/apiextensions-apiserver` from `v0.34.2` to `v0.35.0`
+  * `k8s.io/apimachinery` from `v0.34.2` to `v0.35.0`
+  * `k8s.io/client-go` from `v0.34.2` to `v0.35.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.22.4` to `v0.23.1`
+
+## v0.33.0
+
+* [CHANGE] Update base images from distroless Debian 12 to Debian 13. #355
+* [ENHANCEMENT] Allow the rollout controller to request pod deletions from the zone-aware PDB even when voluntary evictions are disabled. #351
+
+## v0.32.2
+
+* [BUGFIX] Limit webhook metrics to validating and mutating webhook configurations which have a matching grafana.com/namespace label. #347
+* [ENHANCEMENT] Updated dependencies, including: #341
+  * `github.com/prometheus/common` from `v0.67.3` to `v0.67.4`
+  * `golang.org/x/sync` from `v0.18.0` to `v0.19.0`
+* [ENHANCEMENT] Change metric name `rollout_operator_zpdb_inflight_eviction_requests_total` to `rollout_operator_zpdb_inflight_eviction_requests`. #350
+* [ENHANCEMENT] Added alerts mixin and corresponding [runbooks](https://github.com/grafana/rollout-operator/tree/main/docs/runbooks.md). #350
+* [ENHANCEMENT] Added additional dashboard panels to dashboard mixin. #350
+
+## v0.32.1
+
+* [ENHANCEMENT] Dashboard: Support native histograms. #338 
+* [ENHANCEMENT] Updated dependencies, including: #329 #335 #337
+  * `github.com/prometheus/common` from `v0.67.1` to `v0.67.3`
+  * `golang.org/x/crypto` from `v0.43.0` to `v0.45.0`
+  * `golang.org/x/sync` from `v0.17.0` to `v0.18.0`
+  * `k8s.io/api` from `v0.34.1` to `v0.34.2`
+  * `k8s.io/apiextensions-apiserver` from `v0.34.1` to `v0.34.2`
+  * `k8s.io/apimachinery` from `v0.34.1` to `v0.34.2`
+  * `k8s.io/client-go` from `v0.34.1` to `v0.34.2`
+  * `sigs.k8s.io/controller-runtime` from `v0.22.3` to `v0.22.4`
+* [ENHANCEMENT] Added prometheus metrics for `rollout_operator_zpdb_configurations_observed_total`, `rollout_operator_zpdb_eviction_requests_total` and `rollout_operator_zpdb_inflight_eviction_requests_total`
+
+## v0.32.0
+
+* [ENHANCEMENT] Check zone-aware PodDisruptionBudget compliance before deleting Pods during rolling updates. #324
+
+## v0.31.1
+
+* [ENHANCEMENT] Updated dependencies, including: #314, #315
+  * `github.com/prometheus/common` from `v0.66.1` to `v0.67.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.22.0` to `v0.22.3`
+
+## v0.31.0
+
+* [ENHANCEMENT] Add further information to debug logs emitted when processing ZonedPodDisruptionBudget-related requests. #311 
+* [BUGFIX] Keep evicted pod in eviction cache until its phase changes from running, rather than evicting on a pod ContainerStatuses change. Increase pod eviction cache TTL. #312
+
+## v0.30.0
+
+* [ENHANCEMENT] Add rollout-operator libsonnet into this repository. Enable rollout-operator and its webhooks by default. #282
+* [ENHANCEMENT] Add rollout-operator dashboard mixin into this repository. #288
+* [ENHANCEMENT] Add a `kubernetes.cluster-domain` flag for configuring a Kubernetes cluster domain. The default cluster domain `cluster.local.` is unchanged. #266
+* [ENHANCEMENT] Updated dependencies, including: #280 #285 #291
+  * `github.com/prometheus/client_golang` from `v1.23.0` to `v1.23.2`
+  * `github.com/prometheus/common` from `v0.65.0` to `v0.66.1`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.62.0` to `v0.63.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.62.0` to `v0.63.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.37.0` to `v1.38.0`
+  * `go.opentelemetry.io/otel` from `v1.37.0` to `v1.38.0`
+  * `golang.org/x/sync` from `v0.16.0` to `v0.17.0`
+  * `k8s.io/api` from `v0.33.3` to `v0.34.1`
+  * `k8s.io/apiextensions-apiserver` from `v0.33.0` to `v0.34.1`
+  * `k8s.io/apimachinery` from `v0.33.3` to `v0.34.1`
+  * `k8s.io/client-go` from `v0.33.3` to `v0.34.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.21.0` to `v0.22.1`
+
+## v0.29.0
+
+* [CHANGE] Rename flag `server.cluster-validation.http.exclude-paths` to `server.cluster-validation.http.excluded-paths` to align with `dskit`. #247
+* [ENHANCEMENT] Update Go to `1.25` #263
+* [ENHANCEMENT] Updated dependencies, including: #236 #238 #242 #247 #257
+  * `github.com/prometheus/client_golang` from `v1.22.0` to `v1.23.0`
+  * `github.com/prometheus/common` from `v0.64.0` to `v0.65.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace` from `v0.60.0` to `v0.62.0`
+  * `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` from `v0.60.0` to `v0.62.0`
+  * `go.opentelemetry.io/otel` from `v1.36.0` to `v1.37.0`
+  * `go.opentelemetry.io/otel/trace` from `v1.36.0` to `v1.37.0`
+  * `golang.org/x/sync` from `v0.15.0` to `v0.16.0`
+  * `k8s.io/api` from `v0.33.1` to `v0.33.3`
+  * `k8s.io/apimachinery` from `v0.33.1` to `v0.33.3`
+  * `k8s.io/client-go` from `v0.33.1` to `v0.33.3`
+* [ENHANCEMENT] Automatically patch validating and mutating rollout-operator webhooks with the self-signed CA if they are created or modified after the rollout-operator starts. #262, #273
+* [ENHANCEMENT] Support for zone and partition aware pod disruption budgets, enabling finer control over pod eviction policies. #253
+* [BUGFIX] Always configure HTTP client with a timeout. #240
+* [BUGFIX] Use a StatefulSet's `.spec.serviceName` when constructing the delayed downscale endpoint for a pod. #258
+
+## v0.28.0
+
+* [ENHANCEMENT] Updated dependencies, including: #227 #231
+  * `golang.org/x/sync` from `v0.14.0` to `v0.15.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.20.4` to `v0.21.0`
+* [ENHANCEMENT] Migrate to OpenTelemetry tracing library, removing the dependency on OpenTracing. You can now configure tracing using the standard `OTEL_` [environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#batch-span-processor). Previous configurations using `JAEGER_` environment variables will still work, but are deprecated. #234
+
+## v0.27.0
+
+* [CHANGE] Rename metric `rollout_operator_request_invalid_cluster_validation_labels_total` to `rollout_operator_client_invalid_cluster_validation_label_requests_total`. #217
+* [ENHANCEMENT] Add metric `rollout_operator_server_invalid_cluster_validation_label_requests_total`. #223
+* [ENHANCEMENT] Updated dependencies, including: #223 #224
+  * `github.com/prometheus/client_golang` from `v1.21.1` to `v1.22.0`
+  * `github.com/prometheus/common` from `v0.63.0` to `v0.64.0`
+  * `golang.org/x/sync` from `v0.12.0` to `v0.14.0`
+  * `k8s.io/api` from `v0.32.3` to `v0.33.1`
+  * `k8s.io/apimachinery` from `v0.32.3` to `v0.33.1`
+  * `k8s.io/client-go` from `v0.32.3` to `v0.33.1`
+* [BUGFIX] Use a StatefulSet's `.spec.serviceName` when constructing the prepare-downscale endpoint for a pod. #221
+
+## v0.26.0
+
+* [FEATURE] Add cross-cluster traffic protection. #195b
+  * Controlled through the flags `-server.cluster-validation.http.enabled`, `-server.cluster-validation.http.soft-validation`, `-server.cluster-validation.http.exclude-paths`.
+  * Rejected requests can be monitored via the metric `rollout_operator_request_invalid_cluster_validation_labels_total`.
+
+## v0.25.0
+
+* [ENHANCEMENT] Updated dependencies, including: #203
+  * `github.com/prometheus/client_golang` from `v1.20.5` to `v1.21.1`
+  * `github.com/prometheus/common` from `v0.62.0` to `v0.63.0`
+  * `golang.org/x/sync` from `v0.11.0` to `v0.12.0`
+  * `k8s.io/api` from `v0.32.1` to `v0.32.3`
+  * `k8s.io/apimachinery` from `v0.32.1` to `v0.32.3`
+  * `k8s.io/client-go` from `v0.32.1` to `v0.32.3`
+  * `sigs.k8s.io/controller-runtime` from `v0.20.1` to `v0.20.4`
+
+## v0.24.0
+
+* [ENHANCEMENT] Update Go to `1.24` #196
+* [ENHANCEMENT] Updated dependencies, including: #197
+  * `github.com/prometheus/common` from `v0.61.0` to `v0.62.0`
+  * `golang.org/x/sync` from `v0.10.0` to `v0.11.0`
+  * `k8s.io/api` from `v0.32.0` to `v0.32.1`
+  * `k8s.io/apimachinery` from `v0.32.0` to `v0.32.1`
+  * `k8s.io/client-go` from `v0.32.0` to `v0.32.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.19.3` to `v0.20.1`
+
+## v0.23.0
+
+* [ENHANCEMENT] Make timeout for requests to Pods and to the Kubernetes control plane configurable. #188
+* [ENHANCEMENT] Updated dependencies, including: #189 #191
+  * `github.com/prometheus/client_golang` from `v1.20.4` to `v1.20.5`
+  * `github.com/prometheus/common` from `v0.59.1` to `v0.61.0`
+  * `k8s.io/api` from `v0.31.1` to `v0.32.0`
+  * `k8s.io/apimachinery` from `v0.31.1` to `v0.32.0`
+  * `k8s.io/client-go` from `v0.31.1` to `v0.32.0`
+  * `sigs.k8s.io/controller-runtime` from `v0.19.0` to `v0.19.3`
+  * `golang.org/x/net` from `v0.28.0` to `v0.33.0`
+
+## v0.22.0
+
+* [ENHANCEMENT] New parameter log.format allows to set logging format to logfmt (default) or json (new). #184
+* [ENHANCEMENT] Add a 5 minute timeout to requests to Pods and to the Kubernetes control plane. #186
+ 
+## v0.21.0
+
+* [ENHANCEMENT] Log debug information about StatefulSets as they are created, updated and deleted. #182
+
+## v0.20.1
+
+* [BUGFIX] Improved handling of URL ports in `createPrepareDownscaleEndpoints` function. The function now correctly preserves the port when replacing the host in the URL. #176
+
+## v0.20.0
+
+* [ENHANCEMENT] Updated dependencies, including: #174
+  * `github.com/prometheus/client_golang` from `v1.19.1` to `v1.20.4`
+  * `github.com/prometheus/common` from `v0.55.0` to `v0.59.1`
+  * `k8s.io/api` from `v0.30.3` to `v0.31.1`
+  * `k8s.io/apimachinery` from `v0.30.3` to `v0.31.1`
+  * `k8s.io/client-go` from `v0.30.3` to `v0.31.1`
+  * `sigs.k8s.io/controller-runtime` from `v0.18.5` to `v0.19.0`
+
+## v0.19.1
+
+* [CHANGE] Renamed `grafana.com/rollout-mirror-replicas-from-resource-write-back-status-replicas` annotation to `grafana.com/rollout-mirror-replicas-from-resource-write-back`, because it was too long (over 64 chars). #171
+
+## v0.19.0
+
+* [ENHANCEMENT] Updated dependencies, including: #165
+  * `github.com/prometheus/client_golang` from `v1.19.0` to `v1.19.1`
+  * `github.com/prometheus/common` from `v0.53.0` to `v0.55.0`
+  * `golang.org/x/sync` from `v0.7.0` to `v0.8.0`
+  * `k8s.io/api` from `v0.30.0` to `v0.30.3`
+  * `k8s.io/apimachinery` from `v0.30.0` to `v0.30.3`
+  * `k8s.io/client-go` from `v0.30.0` to `v0.30.3`
+  * `sigs.k8s.io/controller-runtime` from `v0.18.1` to `v0.18.5`
+* [ENHANCEMENT] Update Go to `1.23`. #168
+* [ENHANCEMENT] When mirroring replicas of statefulset, rollout-operator can now skip writing back number of replicas to reference resource, by setting `grafana.com/rollout-mirror-replicas-from-resource-write-back-status-replicas` annotation to `false`. #169
+
+## v0.18.0
+
+* [FEATURE] Optionally only scale-up a `StatefulSet` once all of the leader `StatefulSet` replicas are ready. Enable with `grafana.com/rollout-upscale-only-when-leader-ready` annotation set to `true`. #164
+
+## v0.17.1
+
+* [ENHANCEMENT] prepare-downscale admission webhook: undo prepare-shutdown calls if adding the `last-downscale` annotation fails. #151
+
+## v0.17.0
+
+* [CHANGE] The docker base images are now based off distroless images rather than Alpine. #149
+  * The standard base image is now `gcr.io/distroless/static-debian12:nonroot`.
+  * The boringcrypto base image is now `gcr.io/distroless/base-nossl-debian12:nonroot` (for glibc).
+* [ENHANCEMENT] Include unique IDs of webhook requests in logs for easier debugging. #150
+* [ENHANCEMENT] Include k8s operation username in request debug logs. #152
+* [ENHANCEMENT] `rollout-max-unavailable` annotation can now be specified as percentage, e.g.: `rollout-max-unavailable: 25%`. Resulting value is computed as `floor(replicas * percentage)`, but is never less than 1. #153
+* [ENHANCEMENT] Delayed downscale of statefulset can now reduce replicas earlier, if subset of pods at the end of statefulset have already reached their delay. #156
+* [BUGFIX] Fix a mangled error log in controller's delayed downscale code. #154
+
+## v0.16.0
+
+* [ENHANCEMENT] If the POST to prepare-shutdown fails for any replica, attempt to undo the operation by issuing an HTTP DELETE to prepare-shutdown for all target replicas. #146
+
+## v0.15.0
+
+* [CHANGE] Rollout-operator is now released under an Apache License 2.0. #139, #140
+* [ENHANCEMENT] Updated dependencies, including: #144
+  * `github.com/prometheus/common` from `v0.49.0` to `v0.53.0`
+  * `k8s.io/api` from `v0.29.2` to `v0.30.0`
+  * `k8s.io/apimachinery` from `v0.29.2` to `v0.30.0`
+  * `k8s.io/client-go` from `v0.29.2` to `v0.30.0`
+
+## v0.14.0
+
+* [FEATURE] Rollout-operator can now "mirror" replicas of statefulset from any reference resource. `status.replicas` field of reference resource is kept up-to-date with current number of replicas in target statefulset. #129
+* [FEATURE] Rollout-operator can optionally delay downscale of statefulset when mirroring replicas from reference resource. Delay is coordinated with downscaled pods via new endpoint that pods must implement. #131
+* [ENHANCEMENT] Update Go to `1.22`. #133
+* [ENHANCEMENT] Updated dependencies, including: #137
+  * `github.com/prometheus/client_golang` from `v1.18.0` to `v1.19.0`
+  * `github.com/prometheus/common` from `v0.45.0` to `v0.49.0`
+  * `k8s.io/api` from `v0.29.0` to `v0.29.2`
+  * `k8s.io/apimachinery` from `v0.29.0` to `v0.29.2`
+  * `k8s.io/client-go` from `v0.29.0` to `v0.29.2`
+
+## v0.13.0
+
+* [BUGFIX] Consider missing pods as not ready. #127
+
+## v0.12.0
+
+* [ENHANCEMENT] Add metrics for Kubernetes control plane calls. #118 #123
+
+## v0.11.0
+
+* [FEATURE] Coordinate downscaling between zones with a ConfigMap instead of annotation, optionally, via the new zoneTracker for the prepare-downscale admission webhook. #107
+* [ENHANCEMENT] Expose pprof endpoint for profiling. #109
+* [ENHANCEMENT] Change Docker build image to `golang:1.21-bookworm` and update base image to `alpine:3.19`. #97
+* [ENHANCEMENT] Add basic tracing support. #101 #114 #115
+* [ENHANCEMENT] Updated dependencies, including: #111
+  * `github.com/gorilla/mux` from `v1.8.0` to `v1.8.1`
+  * `github.com/prometheus/client_golang` from `v1.17.0` to `v1.18.0`
+  * `golang.org/x/sync` from `v0.5.0` to `v0.6.0`
+  * `k8s.io/api` from `v0.28.3` to `v0.29.0`
+  * `k8s.io/apimachinery` from `v0.28.3` to `v0.29.0`
+  * `k8s.io/client-go` from `v0.28.3` to `v0.29.0`
+
+## v0.10.1
+
+* [BUGFIX] Do not allow downscale if the operator failed to check whether there are StatefulSets with non-updated replicas. #105
+
+## v0.10.0
+
+* [ENHANCEMENT] Proceed with prepare-downscale operation even when pods from zone being downscaled are not ready or not up to date. #99
+* [ENHANCEMENT] Expose metrics for incoming HTTP requests. #100
+
+## v0.9.0
+
+* [ENHANCEMENT] Updated dependencies, including: #93
+  * `github.com/prometheus/client_golang` from `v1.16.0` to `v1.17.0`
+  * `github.com/prometheus/common` from `v0.44.0` to `v0.45.0`
+  * `golang.org/x/sync` from `v0.3.0` to `v0.4.0`
+  * `k8s.io/api` from `v0.28.1` to `v0.28.3`
+  * `k8s.io/apimachinery` from `v0.28.1` to `v0.28.3`
+  * `k8s.io/client-go` from `v0.28.1` to `v0.28.3`
+
+## v0.8.3
+
+* [BUGFIX] Do not exit reconciliation early if there are errors while trying to adjust the number of replicas. #92
+
+## v0.8.2
+
+* [BUGFIX] Do not exit reconciliation early if there are errors while trying to adjust the number of replicas. #90
+
+## v0.8.1
+
+* [ENHANCEMENT] Update the prepare-downscale webhook to check that a rollout is not in progress in the rollout-group, else deny. #82
+
+## v0.8.0
+
+* [ENHANCEMENT] Update Go to `1.21`. #77
+* [ENHANCEMENT] Updated dependencies, including: #78
+  * `github.com/k3d-io/k3d/v5` from `v5.5.2` to `v5.6.0`
+  * `k8s.io/api` from `v0.27.4` to `v0.28.1`
+  * `k8s.io/apimachinery` from `v0.27.4` to `v0.28.1`
+  * `k8s.io/client-go` from `v0.27.4` to `v0.28.1`
+
+## v0.7.0
+
+* [ENHANCEMENT] Updated dependencies, including: #70
+  * `github.com/k3d-io/k3d/v5` from `v5.5.1` to `v5.5.2`
+  * `github.com/prometheus/client_golang` from `v1.15.1` to `v1.16.0`
+  * `github.com/sirupsen/logrus` from `v1.9.2` to `v1.9.3`
+  * `golang.org/x/sync` from `v0.2.0` to `v0.3.0`
+  * `k8s.io/api` from `v0.27.2` to `v0.27.4`
+  * `k8s.io/apimachinery` from `v0.27.2` to `v0.27.4`
+  * `k8s.io/client-go` from `v0.27.2` to `v0.27.4`
+
+## v0.6.1
+
+* [FEATURE] Publish an additional boringcrypto image for linux/amd64,linux/arm64. #71
+* [ENHANCEMENT] Update the intermediate build container for the Docker image to `golang:1.20-alpine3.18`. #71
+
+## v0.6.0
+
+* [ENHANCEMENT] Update Go to `1.20.4`. #55
+* [ENHANCEMENT] Update Docker base image to `alpine:3.18`. #56
+* [ENHANCEMENT] Add the ability to scale statefulsets up and down based on the number of replicas in a "leader" statefulset. #62
+* [ENHANCEMENT] Updated dependencies, including: #63
+  * `github.com/k3d-io/k3d/v5` from `v5.4.9` to `v5.5.1`
+  * `github.com/prometheus/client_golang` from `v1.15.0` to `v1.15.1`
+  * `github.com/prometheus/common` from `v0.42.0` to `v0.44.0`
+  * `github.com/sirupsen/logrus` from `v1.9.0` to `v1.9.2`
+  * `github.com/stretchr/testify` from `v1.8.2` to `v1.8.4`
+  * `go.uber.org/atomic` from `v1.10.0` to `v1.11.0`
+  * `golang.org/x/sync` from `v0.1.0` to `v0.2.0`
+  * `k8s.io/api` from `v0.26.2` to `v0.27.2`
+  * `k8s.io/apimachinery` from `v0.26.2` to `v0.27.2`
+  * `k8s.io/client-go` from `v0.26.2` to `v0.27.2`
+
+## v0.5.0
+
+* [ENHANCEMENT] Add an `/admission/prepare-downscale` mutating admission webhook that prepares pods for shutdown before downscaling. #47 #52
+* [ENHANCEMENT] Update Go to `1.20.3`. #48
+* [ENHANCEMENT] Updated dependencies, including: #49
+  * `github.com/k3d-io/k3d/v5` from `v5.4.7` to `v5.4.9`
+  * `github.com/prometheus/client_golang` from `v1.14.0` to `v1.15.0`
+  * `github.com/prometheus/common` from `v0.39.0` to `v0.42.0`
+  * `github.com/stretchr/testify` from `v1.8.1` to `v1.8.2`
+  * `go.uber.org/atomic` from `v1.9.0` to `v1.10.0`
+  * `k8s.io/api` from `v0.26.1` to `v0.26.2`
+  * `k8s.io/apimachinery` from `v0.26.1` to `v0.26.2`
+  * `k8s.io/client-go` from `v0.26.1` to `v0.26.2`
+
+## v0.4.0
+
+* [ENHANCEMENT] Update Go to `1.20.1`. #39
+* [ENHANCEMENT] Updated dependencies, including: #39 #42
+  * `github.com/k3d-io/k3d/v5` from `v5.4.6` to `v5.4.7`
+  * `github.com/prometheus/client_golang` from `v1.13.0` to `v1.14.0`
+  * `github.com/prometheus/common` from `v0.37.0` to `v0.39.0`
+  * `github.com/stretchr/testify` from `v1.8.0` to `v1.8.1`
+  * `k8s.io/api` from `v0.25.3` to `v0.26.1`
+  * `k8s.io/apimachinery` from `v0.25.3` to `v0.26.1`
+  * `k8s.io/client-go` from `v0.25.3` to `v0.26.1`
+  * `github.com/containerd/containerd` from `v1.6.15` to `v1.6.18` for CVE-2023-25153 and CVE-2023-25173
+  * `golang.org/x/net` from `v0.5.0` to `v0.8.0` for CVE-2022-41723
+* [ENHANCEMENT] Update Docker base image to `alpine:3.17`. #40
+* [ENHANCEMENT] The image published is now a linux/amd64,linux/arm64 multi-platform image. #40
+
+## v0.3.0
+
+* [ENHANCEMENT] Update Go to `1.19.4`. #29
+* [ENHANCEMENT] Added `-reconcile.interval` option to configure the minimum reconciliation interval. #30
+* [ENHANCEMENT] Update dependencies to address CVEs, including: #34
+  * `github.com/containerd/containerd` from `v1.6.8` to `v1.6.15` for CVE-2022-23471
+  * `golang.org/x/net` from `v0.1.0` to `v0.5.0` for CVE-2022-41717
+* [FEATURE] `ValidatingAdmissionWebhook` implementation to prevent downscales on certain resources. #25
+
+## v0.2.0
+
+* [ENHANCEMENT] Update Docker base image to `alpine:3.16`. #23
+* [ENHANCEMENT] Update the minimum go version to `1.18`. #23
+* [ENHANCEMENT] Update dependencies to address CVEs, including: #23
+  * `github.com/gogo/protobuf` from `v1.3.1` to `v1.3.2`
+  * `github.com/prometheus/client_golang` from `v1.11.0` to `v1.13.0`
+  * `golang.org/x/crypto` from `v0.0.0-20200622213623-75b288015ac9` to `v0.1.0`
+  * `k8s.io/client-go` from `v0.18.17` to `v0.25.3`
+
+## v0.1.2
+
+* [ENHANCEMENT] Improve log messages about not read statefulset. #19
+* [BUGFIX] Detect as not-ready pods which are terminating but their readiness probe hasn't failed yet. #20
+
+## v0.1.1
+
+* [BUGFIX] Fix metrics deletion on decommissioned rollout group. #11
+
+## v0.1.0
+
+* [FEATURE] Coordinate rollout of pods belonging to multiple StatefulSets identified by the same `rollout-group` label. #1 #5 #6
+* [FEATURE] Expose Prometheus metrics at `/metrics`. #4
+* [FEATURE] Add readiness probe at `/ready`. #6

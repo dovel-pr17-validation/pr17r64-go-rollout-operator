@@ -1,0 +1,382 @@
+package zpdb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/spanlogger"
+	v1 "k8s.io/api/admission/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/grafana/rollout-operator/pkg/util"
+)
+
+const (
+	logDenyMesg  = "pod eviction denied"
+	logAllowMesg = "pod eviction allowed"
+)
+
+// MaxUnavailableZeroOverride provides an alternate maxUnavailable value to be used when the current maxUnavailable configuration is set to zero.
+type MaxUnavailableZeroOverride struct {
+	maxUnavailable int
+	set            bool
+}
+
+func NewMaxUnavailableZeroOverrideNone() MaxUnavailableZeroOverride {
+	return MaxUnavailableZeroOverride{set: false}
+}
+
+func NewMaxUnavailableZeroOverride(maxUnavailable int) MaxUnavailableZeroOverride {
+	return MaxUnavailableZeroOverride{set: true, maxUnavailable: maxUnavailable}
+}
+
+type EvictionController struct {
+	// a lock used to control finding a specific named lock
+	lock sync.RWMutex
+
+	// a lock for each (zpdb) config name
+	locks map[string]*sync.Mutex
+
+	kubeClient kubernetes.Interface
+	logger     log.Logger
+
+	cfgObserver *configObserver
+	podObserver *podObserver
+	metrics     *Metrics
+
+	resolver spanlogger.TenantResolver
+}
+
+func NewEvictionController(kubeClient kubernetes.Interface, dynamicClient dynamic.Interface, namespace string, podsFactory informers.SharedInformerFactory, logger log.Logger, metrics *Metrics) *EvictionController {
+
+	// watches for ZoneAwarePodDisruptionBudget configurations being applied and maintains a zpdb configuration configCache
+	cfgObserver := newConfigObserver(dynamicClient, namespace, logger, metrics)
+
+	// watches for Pod changes which are reflected into the pod eviction configCache
+	podObserver := newPodObserver(podsFactory, cfgObserver, logger)
+
+	return &EvictionController{
+		locks:       make(map[string]*sync.Mutex, 5),
+		lock:        sync.RWMutex{},
+		cfgObserver: cfgObserver,
+		podObserver: podObserver,
+		kubeClient:  kubeClient,
+		metrics:     metrics,
+		logger:      logger,
+		resolver:    util.NoTenantResolver{},
+	}
+}
+
+// AllowMissingCRDs permits bootstrap before ZPDB protection is installed. Call before Start.
+func (c *EvictionController) AllowMissingCRDs() {
+	c.cfgObserver.startCaches = c.cfgObserver.startAllowMissingCRDs
+}
+
+func (c *EvictionController) Start() error {
+	if err := c.cfgObserver.start(); err != nil {
+		return fmt.Errorf("failed to start zpdb config observer: %w", err)
+	}
+	if err := c.podObserver.start(); err != nil {
+		return fmt.Errorf("failed to start zpdb pod observer: %w", err)
+	}
+	return nil
+}
+
+func (c *EvictionController) Stop() {
+	c.cfgObserver.stop()
+	c.podObserver.stop()
+}
+
+// findLock returns a Mutex for each unique name, creating the Mutex if required.
+func (c *EvictionController) findLock(name string) *sync.Mutex {
+	c.lock.RLock()
+	if pdbLock, exists := c.locks[name]; exists {
+		c.lock.RUnlock()
+		return pdbLock
+	}
+	c.lock.RUnlock()
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if pdbLock, exists := c.locks[name]; exists {
+		return pdbLock
+	}
+
+	c.locks[name] = &sync.Mutex{}
+	return c.locks[name]
+}
+
+// MarkPodAsDeleted allows for a programmatic pod eviction request. It returns an error if the pod eviction is denied.
+// Note that if this func returns without an error, the pod will be marked as pending eviction within the zpdb eviction cache.
+// Note also that this func does not actually evict or delete the pod from kubernetes.
+func (c *EvictionController) MarkPodAsDeleted(ctx context.Context, namespace string, podName string, source string, override MaxUnavailableZeroOverride) error {
+	request := v1.AdmissionReview{
+		Request: &v1.AdmissionRequest{
+			// not a real uid. The eviction_controller only uses this for logging purposes
+			UID: types.UID(fmt.Sprintf("internal-request-pod-eviction-%s-for-rolling-update", podName)),
+			Kind: metav1.GroupVersionKind{
+				Group:   "policy",
+				Version: "v1",
+				Kind:    "Eviction",
+			},
+			Resource: metav1.GroupVersionResource{
+				Group:    "policy",
+				Version:  "v1",
+				Resource: "evictions",
+			},
+			Name:      podName,
+			Namespace: namespace,
+			Operation: v1.Create,
+			UserInfo: authenticationv1.UserInfo{
+				Username: source,
+			},
+			SubResource: "eviction",
+			Object: runtime.RawExtension{
+				Raw: []byte(fmt.Sprintf(`{
+					"apiVersion": "policy/v1",
+					"kind": "Eviction",
+					"metadata": {
+						"name": "%s",
+						"namespace": "%s"
+					}
+				}`, podName, namespace)),
+			},
+		},
+	}
+
+	response := c.HandlePodEvictionRequest(ctx, request, override)
+	if !response.Allowed {
+		return errors.New(response.Result.Message)
+	}
+	return nil
+}
+
+func (c *EvictionController) HasPartitionAwarePdb(pod *corev1.Pod) (bool, error) {
+	pdbConfig, err := c.cfgObserver.pdbCache.find(pod)
+	if err != nil || pdbConfig == nil {
+		return false, err
+	}
+
+	return pdbConfig.podNamePartition != nil, nil
+}
+
+func (c *EvictionController) HandlePodEvictionRequest(ctx context.Context, ar v1.AdmissionReview, maxUnavailableOverride MaxUnavailableZeroOverride) *v1.AdmissionResponse {
+	logger, _ := spanlogger.New(ctx, c.logger, "admission.PodEviction()", c.resolver)
+	defer logger.Finish()
+
+	c.metrics.InFlightRequests.WithLabelValues().Inc()
+	defer c.metrics.InFlightRequests.WithLabelValues().Dec()
+
+	request := admissionReviewRequest{req: ar, log: logger, client: k8sClient{ctx: ctx, kubeClient: c.kubeClient}}
+
+	// set up key=value pairs we include on all logs within this context
+	request.initLogger()
+
+	level.Debug(logger).Log("msg", "considering pod eviction")
+
+	// validate that this is a valid pod eviction create request
+	if err := request.validate(); err != nil {
+		level.Warn(request.log).Log("msg", logDenyMesg, "reason", "not a valid create pod eviction request", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("invalid-request", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusBadRequest)
+	}
+
+	// Before making any Kubernetes API calls, check whether this pod is in zpdb scope at all according to the
+	// pod informer cache. Scope is decided from labels (see config.matchesPod), which - unlike pod readiness -
+	// essentially never change on a running pod, so a stale cached copy is safe to use for this decision. We
+	// deliberately read nothing else from the cached copy: its Status may be stale, so it must never be used
+	// for anything beyond this label match. If the cache says the pod is out of scope, we can allow the
+	// eviction immediately: Kubernetes will still apply any other PDB that covers the pod, and an out-of-scope
+	// pod is allowed here regardless of its readiness anyway, so skipping the readiness check below for it
+	// changes nothing about the outcome. Otherwise - the pod is in scope, the cache found no match for it
+	// (ambiguous, more than one zpdb matched), or the pod isn't in the cache at all - fall through to the live
+	// path below exactly as before.
+	if cachedPod, cacheErr := c.podObserver.podLister.Pods(request.req.Request.Namespace).Get(request.req.Request.Name); cacheErr == nil {
+		if pdbConfig, findErr := c.cfgObserver.pdbCache.find(cachedPod); findErr == nil && pdbConfig == nil {
+			level.Debug(request.log).Log("msg", logAllowMesg, "reason", "pod is not within a zpdb scope")
+			c.metrics.EvictionRequests.WithLabelValues("pod-not-in-scope", fmt.Sprintf("%d", http.StatusOK)).Inc()
+			return request.allow()
+		}
+	}
+
+	// get the pod which has been requested for eviction
+	var pod *corev1.Pod
+	var err error
+	if pod, err = request.client.podByName(request.req.Request.Namespace, request.req.Request.Name); err != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to find pod by name", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("pod-not-found", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusBadRequest)
+	}
+
+	level.Debug(request.log).Log(
+		"msg", "found pod",
+		"generation-observed", pod.Generation,
+		"reason", pod.Status.Reason,
+		"phase", pod.Status.Phase,
+		"creation-timestamp", pod.CreationTimestamp,
+		"deletion-timestamp", pod.DeletionTimestamp,
+	)
+
+	// evicting a terminal pod should result in direct deletion of pod as it already caused disruption by the time we are evicting.
+	if request.canIgnorePDBForPod(pod) {
+		level.Info(request.log).Log("msg", logAllowMesg, "reason", "pod is not ready")
+		c.metrics.EvictionRequests.WithLabelValues("pod-not-ready", fmt.Sprintf("%d", http.StatusOK)).Inc()
+		return request.allowWithWarning("pod is not ready")
+	}
+
+	// find the pdb which applies to this pod
+	// for pods not managed by a zpdb we allow the request we allow the request and Kubernetes will continue to apply any other static PDB
+	pdbConfig, err := c.cfgObserver.pdbCache.find(pod)
+	if err != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("cfg-not-found", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusBadRequest)
+	} else if pdbConfig == nil {
+		level.Debug(request.log).Log("msg", logAllowMesg, "reason", "pod is not within a zpdb scope")
+		c.metrics.EvictionRequests.WithLabelValues("pod-not-in-scope", fmt.Sprintf("%d", http.StatusOK)).Inc()
+		return request.allow()
+	}
+	ownerRef, err := statefulSetOwnerReference(pod)
+	if err != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to find pod owner", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("sts-no-found", fmt.Sprintf("%d", http.StatusInternalServerError)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusInternalServerError)
+	}
+
+	lock := c.findLock(pdbConfig.name)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// A single live list keeps the owner and related zones consistent while saving an API request.
+	allStatefulSets, listErr := request.client.findRelatedStatefulSets(pod.Namespace, pdbConfig.selector)
+	if listErr != nil {
+		// Preserve the owner and maxUnavailable checks when the zone list fails.
+		allStatefulSets = nil
+	}
+
+	var sts *appsv1.StatefulSet
+	if sts, err = request.client.owner(pod, ownerRef, allStatefulSets); err != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to find pod owner", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("sts-no-found", fmt.Sprintf("%d", http.StatusInternalServerError)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusInternalServerError)
+	}
+
+	// ie ingester-zone-a
+	request.log.SetSpanAndLogTag("owner", sts.Name)
+
+	// the number of allowed unavailable pods in other zones.
+	maxUnavailable := pdbConfig.maxUnavailablePods(sts)
+
+	// if maxUnavailable is 0 (no voluntary evictions), replace this value with an override if it has been set.
+	// this allows the rollout controller to still request pods to be updated (deleted) during rolling updates
+	// even if the voluntary pod evictions have been otherwise disabled.
+	if maxUnavailable == 0 && maxUnavailableOverride.set {
+		maxUnavailable = maxUnavailableOverride.maxUnavailable
+	}
+
+	if maxUnavailable == 0 {
+		level.Info(request.log).Log("msg", logDenyMesg, "reason", "max unavailable = 0")
+		c.metrics.EvictionRequests.WithLabelValues("max-unavailable-0", fmt.Sprintf("%d", http.StatusForbidden)).Inc()
+		return request.denyWithReason("max unavailable = 0", http.StatusForbidden)
+	}
+	if listErr != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to find related stateful sets - a minimum of 2 StatefulSets is required", "err", listErr)
+		c.metrics.EvictionRequests.WithLabelValues("min-sts-not-found", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason("minimum number of StatefulSets not found", http.StatusBadRequest)
+	}
+
+	// Assumption - each StatefulSet manages all the pods for a single zone. This list of StatefulSets covers all zones.
+	// During a migration it may be possible to break this assumption, but during a migration the maxUnavailable will be set to 0 and the eviction request will be denied.
+	if allStatefulSets == nil || len(allStatefulSets.Items) <= 1 {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to find related stateful sets - a minimum of 2 StatefulSets is required")
+		c.metrics.EvictionRequests.WithLabelValues("min-sts-not-found", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason("minimum number of StatefulSets not found", http.StatusBadRequest)
+	}
+	ownerInGroup := false
+	for i := range allStatefulSets.Items {
+		if allStatefulSets.Items[i].UID == sts.UID {
+			ownerInGroup = true
+			break
+		}
+	}
+	if !ownerInGroup {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "owner StatefulSet is not in the related StatefulSets", "sts", sts.Name)
+		c.metrics.EvictionRequests.WithLabelValues("owner-sts-not-in-group", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason("owner StatefulSet is not in the related StatefulSets", http.StatusBadRequest)
+	}
+
+	// this is the partition of the pod being evicted - for classic zones the partition will be an empty string
+	partition, err := pdbConfig.podPartition(pod)
+	if err != nil {
+		level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to determine partition for pod", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("partition-not-identified", fmt.Sprintf("%d", http.StatusBadRequest)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusBadRequest)
+	}
+
+	// include the partition we are considering
+	if len(partition) > 0 {
+		request.log.SetSpanAndLogTag("partition", partition)
+	}
+
+	// include the number of zones we will be considering
+	request.log.SetSpanAndLogTag("zones", len(allStatefulSets.Items))
+
+	var pdb validator
+
+	if len(partition) > 0 {
+		// partition mode - the pod tallies are applied to all pods in other zones which relate to this partition
+		pdb = newValidatorPartitionAware(sts, partition, len(allStatefulSets.Items), pdbConfig, c.podObserver.podEvictCache, request.log)
+	} else {
+		// zone mode - we allow the eviction if no other zone is disrupted and the max unavailable within the eviction zone is not exceeded
+		pdb = newValidatorZoneAware(sts, len(allStatefulSets.Items), c.podObserver.podEvictCache)
+	}
+
+	for _, otherSts := range allStatefulSets.Items {
+		// test on whether we exclude the eviction pod's StatefulSet from the assessment
+		if !pdb.considerSts(&otherSts) {
+			continue
+		}
+
+		result, err := request.client.podsNotRunningAndReady(&otherSts, pod, pdb)
+		if err != nil {
+			level.Error(request.log).Log("msg", logDenyMesg, "reason", "unable to determine pod status in related StatefulSet", "sts", otherSts.Name)
+			c.metrics.EvictionRequests.WithLabelValues("err: sts-pod-status-not-determined", fmt.Sprintf("%d", http.StatusInternalServerError)).Inc()
+			return request.denyWithReason("unable to determine pod status in related StatefulSet", http.StatusInternalServerError)
+		}
+
+		if err = pdb.accumulateResult(&otherSts, result); err != nil {
+			// opportunity to fail fast
+			level.Info(request.log).Log("msg", logDenyMesg, "err", err, "sts", otherSts.Name)
+			c.metrics.EvictionRequests.WithLabelValues("denied", fmt.Sprintf("%d", http.StatusTooManyRequests)).Inc()
+			return request.denyWithReason(err.Error(), http.StatusTooManyRequests)
+		}
+
+	}
+
+	if err = pdb.validate(maxUnavailable); err != nil {
+		level.Info(request.log).Log("msg", logDenyMesg, "reason", "zpdb exceeded", "err", err)
+		c.metrics.EvictionRequests.WithLabelValues("denied", fmt.Sprintf("%d", http.StatusTooManyRequests)).Inc()
+		return request.denyWithReason(err.Error(), http.StatusTooManyRequests)
+	}
+
+	// mark the pod as recently evicted
+	c.podObserver.recordEviction(pod)
+
+	level.Info(request.log).Log("msg", logAllowMesg, "reason", pdb.successMessage())
+	c.metrics.EvictionRequests.WithLabelValues("allowed", fmt.Sprintf("%d", http.StatusOK)).Inc()
+	return request.allow()
+}
